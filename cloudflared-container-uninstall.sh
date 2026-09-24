@@ -326,17 +326,25 @@ remove_policy_routing_two_nic() {
 
 #------------------------------------------------------------------------------
 # 5b) Remove Cloudflare Tunnel edge static routes and ipv4.never-default,
-#     as currently applied by configure_edge_routing() in
+#     as applied by configure_edge_routing() in
 #     cloudflared-container-setup.sh (nmcli +ipv4.routes / ipv4.never-default
 #     on the edge interface's own NetworkManager connection -- NOT the
-#     origin policy-routing-table model handled above). Auto-detects
-#     whichever NetworkManager connection currently has ipv4.never-default
-#     set, since that is the marker setup uses for the edge connection; a
-#     no-op if none is found. Clears the entire ipv4.routes property on that
-#     connection (setting it to "" resets it, per NetworkManager's nmcli
-#     reference), since setup is the only thing expected to add routes there
-#     and route contents (e.g. api.cloudflare.com's resolved IPs) can drift
-#     over time -- easier and more reliable than removing individual entries.
+#     origin policy-routing-table model handled above). Auto-detects the
+#     edge connection by scanning every connection's ipv4.routes for the
+#     Cloudflare Tunnel /24 markers (198.41.192.0/24 / 198.41.200.0/24),
+#     which every version of the setup script has always added -- this is
+#     more reliable than relying on ipv4.never-default=yes alone, since
+#     that flag was only added in a later version of the setup script and
+#     hosts set up before it will have the static routes but never set
+#     that flag. Also includes any connection that DOES have
+#     ipv4.never-default=yes, in case a future version of the setup
+#     script sets that flag without also matching these exact prefixes.
+#     A no-op if neither is found. Clears the entire ipv4.routes property
+#     on each matched connection (setting it to "" resets it, per
+#     NetworkManager's nmcli reference), since setup is the only thing
+#     expected to add routes there and route contents (e.g.
+#     api.cloudflare.com's resolved IPs) can drift over time -- easier
+#     and more reliable than removing individual entries.
 #------------------------------------------------------------------------------
 remove_edge_static_routes() {
   command -v nmcli >/dev/null 2>&1 || {
@@ -344,9 +352,34 @@ remove_edge_static_routes() {
     return 0
   }
 
-  info "Scanning for NetworkManager connections with static edge routes (ipv4.never-default=yes)"
+  info "Scanning NetworkManager connections for Cloudflare Tunnel edge static routes"
 
-  local con dev found_any=0
+  local edge_marker="198.41.192.0/24"
+  local con matched_cons="" found_any=0
+
+  # Match 1: any connection whose ipv4.routes contains the Cloudflare
+  # Tunnel edge marker prefix -- present regardless of setup script
+  # version, since every version has always added this route.
+  while IFS= read -r con; do
+    [[ -n "$con" ]] || continue
+    local routes
+    routes="$(nmcli -t -g ipv4.routes connection show "$con" 2>/dev/null)"
+    if [[ "$routes" == *"${edge_marker}"* ]]; then
+      matched_cons="${matched_cons}${con}"$'\n'
+    fi
+  done < <(nmcli -t -f NAME connection show 2>/dev/null)
+
+  # Match 2: any connection with ipv4.never-default=yes (set by newer
+  # setup script versions), in case its routes don't include the marker
+  # for some reason.
+  while IFS= read -r con; do
+    [[ -n "$con" ]] || continue
+    matched_cons="${matched_cons}${con}"$'\n'
+  done < <(nmcli -t -f NAME,ipv4.never-default connection show 2>/dev/null | awk -F: '$2=="yes" {print $1}')
+
+  matched_cons="$(printf '%s' "$matched_cons" | sort -u)"
+
+  local dev
   while IFS= read -r con; do
     [[ -n "$con" ]] || continue
     found_any=1
@@ -375,7 +408,7 @@ remove_edge_static_routes() {
     else
       warn "Connection ${con} is not currently attached to a device; changes are saved but not yet applied."
     fi
-  done < <(nmcli -t -f NAME,ipv4.never-default connection show 2>/dev/null | awk -F: '$2=="yes" {print $1}')
+  done <<<"$matched_cons"
 
   if [[ "$found_any" -eq 1 ]]; then
     info "Cloudflare Tunnel edge static route cleanup complete."
