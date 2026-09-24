@@ -16,9 +16,12 @@
 #  3) Disable linger for the instance's user
 #  4) Remove /etc/sysctl.d/99-cloudflared.conf (ping_group_range, UDP buffers)
 #     -- shared by both instances, removed once
-#  5) Policy routing cleanup -- ALWAYS runs and auto-detects whatever is
-#     present, regardless of which interface it's on or whether setup put
-#     it there. No prompt needed; every step is a no-op if nothing matches:
+#  5) Policy routing cleanup (legacy) -- ALWAYS runs and auto-detects
+#     whatever is present, regardless of which interface it's on or
+#     whether setup put it there. No prompt needed; every step is a
+#     no-op if nothing matches. Covers an older setup script design
+#     (ip-rule/route-table based) kept here for hosts set up before the
+#     current nmcli-static-route design (see 5b):
 #      - remove any ip rule that routes into table "origin"
 #      - remove any RFC1918 routes from route-table "origin"
 #      - remove the "origin" entry from /etc/iproute2/rt_tables
@@ -27,6 +30,14 @@
 #      - restore any NetworkManager profile with ipv4.never-default yes
 #        (re-enable default-route eligibility; gateway is not restored
 #        since setup does not record the original value)
+#  5b) Cloudflare Tunnel edge static routes cleanup -- ALWAYS runs.
+#     Reverses the current configure_edge_routing() design: auto-detects
+#     the NetworkManager connection with ipv4.never-default=yes (the
+#     edge interface's connection), clears all of its ipv4.routes
+#     entries (the Cloudflare Tunnel edge /24s, 1.1.1.1/1.0.0.1, and
+#     the resolved api.cloudflare.com / cfd-features.argotunnel.com
+#     addresses), and resets ipv4.never-default to no. Gateway is not
+#     restored since setup does not record the original value.
 #  6) Remove /etc/systemd/journald.conf.d/99-persistent.conf (persistent
 #     journaling) and restart journald if requested
 #  7) Remove /etc/profile.d/cloudflared-aliases.sh (contains both prod and
@@ -46,8 +57,10 @@
 #    at the end for you to run manually if desired.
 #  - eth0's default route / gateway -- setup never modifies eth0, so
 #    uninstall never touches it either.
-#  - Any Cloudflare edge IP allow-list routes -- setup does not create
-#    these, so there is nothing to reverse here.
+#  - The edge connection's original gateway value -- setup does not
+#    record it before ipv4.never-default strips it, so it isn't
+#    restored; set it manually afterward if the interface still needs
+#    a default route: nmcli con mod <connection> ipv4.gateway <ip>
 #
 # Usage:
 #   sudo bash cloudflared-container-uninstall.sh
@@ -312,6 +325,66 @@ remove_policy_routing_two_nic() {
 }
 
 #------------------------------------------------------------------------------
+# 5b) Remove Cloudflare Tunnel edge static routes and ipv4.never-default,
+#     as currently applied by configure_edge_routing() in
+#     cloudflared-container-setup.sh (nmcli +ipv4.routes / ipv4.never-default
+#     on the edge interface's own NetworkManager connection -- NOT the
+#     origin policy-routing-table model handled above). Auto-detects
+#     whichever NetworkManager connection currently has ipv4.never-default
+#     set, since that is the marker setup uses for the edge connection; a
+#     no-op if none is found. Clears the entire ipv4.routes property on that
+#     connection (setting it to "" resets it, per NetworkManager's nmcli
+#     reference), since setup is the only thing expected to add routes there
+#     and route contents (e.g. api.cloudflare.com's resolved IPs) can drift
+#     over time -- easier and more reliable than removing individual entries.
+#------------------------------------------------------------------------------
+remove_edge_static_routes() {
+  command -v nmcli >/dev/null 2>&1 || {
+    warn "nmcli not found; skipping Cloudflare Tunnel edge static route cleanup."
+    return 0
+  }
+
+  info "Scanning for NetworkManager connections with static edge routes (ipv4.never-default=yes)"
+
+  local con dev found_any=0
+  while IFS= read -r con; do
+    [[ -n "$con" ]] || continue
+    found_any=1
+
+    local existing_routes
+    existing_routes="$(nmcli -t -g ipv4.routes connection show "$con" 2>/dev/null)"
+    if [[ -n "$existing_routes" ]]; then
+      info "Removing all static routes from connection: ${con}"
+      nmcli connection modify "$con" ipv4.routes "" 2>/dev/null || \
+        warn "Failed to clear ipv4.routes on ${con}"
+    else
+      info "No static routes found on connection: ${con}"
+    fi
+
+    info "Resetting ipv4.never-default on connection: ${con}"
+    nmcli connection modify "$con" ipv4.never-default no 2>/dev/null || \
+      warn "Failed to reset ipv4.never-default on ${con}"
+    info "Note: the original gateway for '${con}' was not recorded by setup;"
+    info "      set it manually if needed: nmcli con mod ${con} ipv4.gateway <ip>"
+
+    dev="$(nmcli -t -f NAME,DEVICE connection show 2>/dev/null | awk -F: -v c="$con" '$1==c {print $2; exit}')"
+    if [[ -n "$dev" ]]; then
+      nmcli device reapply "$dev" >/dev/null 2>&1 || \
+        nmcli connection up "$con" >/dev/null 2>&1 || \
+        warn "Failed to reapply/bring up connection: ${con} (may not be active right now)"
+    else
+      warn "Connection ${con} is not currently attached to a device; changes are saved but not yet applied."
+    fi
+  done < <(nmcli -t -f NAME,ipv4.never-default connection show 2>/dev/null | awk -F: '$2=="yes" {print $1}')
+
+  if [[ "$found_any" -eq 1 ]]; then
+    info "Cloudflare Tunnel edge static route cleanup complete."
+  else
+    info "No Cloudflare Tunnel edge static routes found; nothing to remove."
+  fi
+}
+
+#------------------------------------------------------------------------------
 # 6) Remove persistent journaling configuration
 #------------------------------------------------------------------------------
 remove_journaling_config() {
@@ -507,6 +580,11 @@ main() {
   echo
   remove_policy_routing_two_nic
 
+  # 5b. Remove Cloudflare Tunnel edge static routes (nmcli +ipv4.routes /
+  # ipv4.never-default) -- always runs, auto-detects the edge connection.
+  echo
+  remove_edge_static_routes
+
   # 6. Remove persistent journaling config
   echo
   read -r -p "Remove persistent journaling configuration? [y/N]: " REMOVE_JOURNAL
@@ -559,7 +637,8 @@ main() {
     fi
   fi
   echo "  - /etc/sysctl.d/99-cloudflared.conf removed"
-  echo "  - Any leftover policy routing removed (ip rules, origin table routes, rt_tables entry, persistence files, NetworkManager profile -- auto-detected)"
+  echo "  - Any leftover legacy policy routing removed (ip rules, origin table routes, rt_tables entry, persistence files, NetworkManager profile -- auto-detected)"
+  echo "  - Cloudflare Tunnel edge static routes and ipv4.never-default removed from the edge NetworkManager connection (auto-detected)"
   [[ "$REMOVE_JOURNAL" == "y" ]] && echo "  - Persistent journaling configuration removed"
   echo "  - /etc/profile.d/cloudflared-aliases.sh removed"
   echo "  - /usr/local/sbin/cloudflared-container management command removed"
