@@ -102,7 +102,16 @@ nm_connection_for_iface() {
 # rather than dig, since dig/bind-utils may not be installed.
 resolve_ipv4_addresses() {
   local host="$1"
-  getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u
+  # getent exits non-zero when a hostname has no A/AAAA record (e.g.
+  # cfd-features.argotunnel.com, which is resolved elsewhere as a TXT
+  # record). Under `set -o pipefail`, that non-zero status would
+  # otherwise propagate out of this pipeline and -- because callers
+  # capture this function's output via command substitution with no
+  # `|| true` guard of their own -- kill the whole script under
+  # `set -e` before they ever get a chance to check for an empty
+  # result. The `|| true` neutralizes that; callers already treat
+  # empty output as "could not resolve" and warn/skip accordingly.
+  getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u || true
 }
 
 # Static IPv4 CIDR ranges covering Cloudflare's documented Tunnel edge
@@ -445,7 +454,16 @@ nm_connection_for_iface() {
 # rather than dig, since dig/bind-utils may not be installed.
 resolve_ipv4_addresses() {
   local host="$1"
-  getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u
+  # getent exits non-zero when a hostname has no A/AAAA record (e.g.
+  # cfd-features.argotunnel.com, which is resolved elsewhere as a TXT
+  # record). Under `set -o pipefail`, that non-zero status would
+  # otherwise propagate out of this pipeline and -- because callers
+  # capture this function's output via command substitution with no
+  # `|| true` guard of their own -- kill the whole script under
+  # `set -e` before they ever get a chance to check for an empty
+  # result. The `|| true` neutralizes that; callers already treat
+  # empty output as "could not resolve" and warn/skip accordingly.
+  getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u || true
 }
 
 # Static IPv4 CIDR ranges covering Cloudflare's documented Tunnel edge
@@ -589,7 +607,12 @@ configure_edge_routing() {
 edge_iface_from_container_file() {
   [[ -f "$CONTAINER_FILE" ]] || { warn "Container unit not found: ${CONTAINER_FILE}"; return 1; }
   local iface
-  iface="$(grep -Eo 'pasta:-i,[^[:space:]]+' "$CONTAINER_FILE" 2>/dev/null | sed -E 's/^pasta:-i,//' | head -n1)"
+  # grep -Eo exits non-zero when the pattern isn't found. Under
+  # `set -o pipefail` that would otherwise kill this assignment (and,
+  # without a guard at the call site, the whole script) before the
+  # empty-check below ever runs -- add `|| true` so a genuine "not
+  # found" is reported by that check instead of a silent script exit.
+  iface="$(grep -Eo 'pasta:-i,[^[:space:]]+' "$CONTAINER_FILE" 2>/dev/null | sed -E 's/^pasta:-i,//' | head -n1 || true)"
   if [[ -z "$iface" ]]; then
     warn "Could not determine the edge interface from ${CONTAINER_FILE} (no 'pasta:-i,<iface>' network line found)."
     return 1
@@ -821,7 +844,10 @@ action_upgrade() {
   [[ -f "$IMAGE_DROPIN" ]] || die "Image drop-in not found: ${IMAGE_DROPIN}"
 
   local current_tag=""
-  current_tag="$(grep -E '^Image=' "$IMAGE_DROPIN" 2>/dev/null | sed -E 's#^Image=docker\.io/cloudflare/cloudflared:##')"
+  # `|| true` guards against grep's non-zero "no match" exit under
+  # `set -o pipefail` silently killing the script (see comment on
+  # resolve_ipv4_addresses for the same failure mode).
+  current_tag="$(grep -E '^Image=' "$IMAGE_DROPIN" 2>/dev/null | sed -E 's#^Image=docker\.io/cloudflare/cloudflared:##' || true)"
 
   echo
   info "Current image tag: ${current_tag:-unknown}"
@@ -841,8 +867,8 @@ action_upgrade() {
   # Preserve the existing TUNNEL_EDGE_IP_VERSION / TUNNEL_EDGE_BIND_ADDRESS
   # settings rather than dropping them on upgrade.
   local current_edge_ip_version current_edge_bind_address
-  current_edge_ip_version="$(grep -E '^Environment=TUNNEL_EDGE_IP_VERSION=' "$IMAGE_DROPIN" 2>/dev/null | sed -E 's#^Environment=TUNNEL_EDGE_IP_VERSION=##')"
-  current_edge_bind_address="$(grep -E '^Environment=TUNNEL_EDGE_BIND_ADDRESS=' "$IMAGE_DROPIN" 2>/dev/null | sed -E 's#^Environment=TUNNEL_EDGE_BIND_ADDRESS=##')"
+  current_edge_ip_version="$(grep -E '^Environment=TUNNEL_EDGE_IP_VERSION=' "$IMAGE_DROPIN" 2>/dev/null | sed -E 's#^Environment=TUNNEL_EDGE_IP_VERSION=##' || true)"
+  current_edge_bind_address="$(grep -E '^Environment=TUNNEL_EDGE_BIND_ADDRESS=' "$IMAGE_DROPIN" 2>/dev/null | sed -E 's#^Environment=TUNNEL_EDGE_BIND_ADDRESS=##' || true)"
   current_edge_ip_version="${current_edge_ip_version:-4}"
 
   info "Updating image drop-in: ${IMAGE_DROPIN}"
