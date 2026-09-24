@@ -96,25 +96,50 @@ nm_connection_for_iface() {
     | awk -F: -v d="$iface" '$1==d {print $2; exit}'
 }
 
+# Print every distinct IPv4 address a hostname resolves to (one per
+# line), or nothing on failure. Uses getent (NSS-aware: honours
+# /etc/hosts and nsswitch.conf, same resolution path applications use)
+# rather than dig, since dig/bind-utils may not be installed.
+resolve_ipv4_addresses() {
+  local host="$1"
+  getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u
+}
+
 # Static IPv4 CIDR ranges covering Cloudflare's documented Tunnel edge
 # addresses (region1.v2.argotunnel.com / region2.v2.argotunnel.com,
 # TCP/UDP port 7844), for the default (non-US, non-FedRAMP) region. See:
 # https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/tunnel-with-firewall/
 readonly CLOUDFLARE_TUNNEL_EDGE_PREFIXES=("198.41.192.0/24" "198.41.200.0/24")
 
-# Route only Cloudflare's Tunnel edge ranges out the edge interface (e.g.
-# eth1), via that interface's own gateway. The default route and every
-# other destination -- including RFC 1918 ranges and general internet
-# egress (package repos, container registries, etc.) -- are left
-# completely untouched on the primary interface (normally eth0).
+# Hostnames cloudflared also talks to that should be routed the same
+# way as the tunnel edge itself: api.cloudflare.com (software update
+# checks) and cfd-features.argotunnel.com (QUIC datagram version
+# negotiation, resolved as a DNS TXT lookup but the A/AAAA lookup of
+# the same name is what actually gets routed here). See:
+# https://developers.cloudflare.com/tunnel/configuration/
+readonly CLOUDFLARE_TUNNEL_EDGE_HOSTNAMES=("api.cloudflare.com" "cfd-features.argotunnel.com")
+
+# Fixed IPv4 host addresses (Cloudflare's public DNS resolver) to route
+# the same way as the tunnel edge.
+readonly CLOUDFLARE_TUNNEL_EDGE_HOSTS=("1.1.1.1" "1.0.0.1")
+
+# Route Cloudflare Tunnel's edge ranges, the resolved addresses of
+# api.cloudflare.com / cfd-features.argotunnel.com, and 1.1.1.1/1.0.0.1
+# out the edge interface (e.g. eth1), via that interface's own gateway.
+# Also marks the edge connection ipv4.never-default so NetworkManager
+# never assigns it the default route (belt-and-suspenders on top of the
+# static routes: the default route and every other destination --
+# general internet egress, RFC 1918 ranges, etc. -- stay on the primary
+# interface, normally eth0, untouched).
 #
-# This is intentionally narrow: it does NOT touch the default route or
-# its metric on either interface. Only these two specific /24s are
-# added as static routes via the edge interface's gateway.
+# Applied via NetworkManager (nmcli) so changes survive reboots. Uses
+# "nmcli device reapply" rather than "connection up" so changes take
+# effect without a full connection bounce.
 #
-# Applied via NetworkManager (nmcli) so the change survives reboots.
-# Uses "nmcli device reapply" rather than "connection up" so the change
-# takes effect without a full connection bounce.
+# Idempotent and safe to re-run: re-running the setup script, or the
+# "Refresh Cloudflare edge routes" management-tool action, picks up any
+# newly-resolved IPs for the hostnames above without disturbing routes
+# that are already present.
 configure_edge_routing() {
   local edge_iface="$1"
 
@@ -137,7 +162,7 @@ configure_edge_routing() {
   local edge_gateway
   edge_gateway="$(default_route_gateway_on_iface "$edge_iface")"
   if [[ -z "$edge_gateway" ]]; then
-    warn "Could not determine a gateway on ${edge_iface} (no default route present on it); skipping Cloudflare Tunnel edge static routes. You may need to add these routes manually: ${CLOUDFLARE_TUNNEL_EDGE_PREFIXES[*]}"
+    warn "Could not determine a gateway on ${edge_iface} (no default route present on it); skipping Cloudflare Tunnel edge static routes."
     return 0
   fi
 
@@ -148,18 +173,42 @@ configure_edge_routing() {
     return 0
   fi
 
+  # Build the full list of host routes (CIDR prefixes) to add: the
+  # fixed Cloudflare Tunnel edge /24s, the fixed 1.1.1.1/1.0.0.1 hosts,
+  # and whatever api.cloudflare.com / cfd-features.argotunnel.com
+  # currently resolve to (as /32s). Resolution failures are warned
+  # about but do not abort the rest of the routing setup.
+  local edge_prefixes=("${CLOUDFLARE_TUNNEL_EDGE_PREFIXES[@]}")
+  local host_ip
+  for host_ip in "${CLOUDFLARE_TUNNEL_EDGE_HOSTS[@]}"; do
+    edge_prefixes+=("${host_ip}/32")
+  done
+
+  local hostname resolved_ips ip
+  for hostname in "${CLOUDFLARE_TUNNEL_EDGE_HOSTNAMES[@]}"; do
+    resolved_ips="$(resolve_ipv4_addresses "$hostname")"
+    if [[ -z "$resolved_ips" ]]; then
+      warn "Could not resolve ${hostname} to an IPv4 address; skipping its route for now."
+      continue
+    fi
+    while IFS= read -r ip; do
+      [[ -n "$ip" ]] && edge_prefixes+=("${ip}/32")
+    done <<<"$resolved_ips"
+  done
+
   echo
-  info "Planned network change so this host reaches Cloudflare Tunnel edge servers via ${edge_iface}, while everything else (including the public internet and RFC 1918 destinations) keeps using ${primary_iface} unchanged:"
-  info "  - Add static routes via ${edge_gateway} on '${edge_conn}' (${edge_iface}) for: ${CLOUDFLARE_TUNNEL_EDGE_PREFIXES[*]}"
-  read -r -p "Apply this network change now? [y/N]: " confirm_routing
+  info "Planned network changes so this host reaches Cloudflare Tunnel edge servers via ${edge_iface}, while everything else (including the public internet and RFC 1918 destinations) keeps using ${primary_iface} unchanged:"
+  info "  - Add static routes via ${edge_gateway} on '${edge_conn}' (${edge_iface}) for: ${edge_prefixes[*]}"
+  info "  - Set ipv4.never-default=yes on '${edge_conn}' (${edge_iface}) so NetworkManager never assigns it the default route"
+  read -r -p "Apply these network changes now? [y/N]: " confirm_routing
   if [[ "${confirm_routing,,}" != "y" ]]; then
-    warn "Skipping Cloudflare Tunnel edge static routes at your request."
+    warn "Skipping Cloudflare Tunnel edge routing changes at your request."
     return 0
   fi
 
   local existing_routes prefix route_changed=0
   existing_routes="$(nmcli -t -g ipv4.routes connection show "$edge_conn" 2>/dev/null)"
-  for prefix in "${CLOUDFLARE_TUNNEL_EDGE_PREFIXES[@]}"; do
+  for prefix in "${edge_prefixes[@]}"; do
     if [[ "$existing_routes" == *"${prefix}"* ]]; then
       info "Route for ${prefix} already present on '${edge_conn}', leaving as-is."
       continue
@@ -170,9 +219,20 @@ configure_edge_routing() {
     route_changed=1
   done
 
+  local current_never_default
+  current_never_default="$(nmcli -t -g ipv4.never-default connection show "$edge_conn" 2>/dev/null)"
+  if [[ "${current_never_default,,}" != "yes" ]]; then
+    info "Setting ipv4.never-default=yes on '${edge_conn}' (${edge_iface})"
+    nmcli connection modify "$edge_conn" ipv4.never-default yes \
+      || { warn "Failed to set ipv4.never-default on '${edge_conn}'"; }
+    route_changed=1
+  else
+    info "ipv4.never-default already set on '${edge_conn}', leaving as-is."
+  fi
+
   if [[ "$route_changed" == "1" ]]; then
     nmcli device reapply "$edge_iface" \
-      || warn "Failed to reapply '${edge_conn}' on ${edge_iface}; routes are saved but may need 'nmcli connection up ${edge_conn}' (or a reboot) to take effect."
+      || warn "Failed to reapply '${edge_conn}' on ${edge_iface}; changes are saved but may need 'nmcli connection up ${edge_conn}' (or a reboot) to take effect."
   fi
 
   echo
@@ -353,6 +413,188 @@ iface_for_ipv4_address() {
   local addr="$1"
   ip -4 -o addr show scope global 2>/dev/null \
     | awk -v a="$addr" '{split($4,parts,"/"); if (parts[1]==a) {print $2; exit}}'
+}
+
+# Print the interface currently holding the default (0.0.0.0/0) IPv4
+# route, or nothing if there isn't one.
+default_route_iface() {
+  ip -4 route show default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1
+}
+
+# Print the gateway of the default IPv4 route on the given interface, or
+# nothing if that interface has no default route.
+default_route_gateway_on_iface() {
+  local iface="$1"
+  ip -4 route show default dev "$iface" 2>/dev/null \
+    | awk '{for (i=1;i<=NF;i++) if ($i=="via") print $(i+1)}' | head -n1
+}
+
+# Print the NetworkManager connection name that currently owns the given
+# interface, or nothing if NetworkManager doesn't manage it (or isn't
+# running).
+nm_connection_for_iface() {
+  local iface="$1"
+  command -v nmcli >/dev/null 2>&1 || return 0
+  nmcli -t -f DEVICE,CONNECTION device status 2>/dev/null \
+    | awk -F: -v d="$iface" '$1==d {print $2; exit}'
+}
+
+# Print every distinct IPv4 address a hostname resolves to (one per
+# line), or nothing on failure. Uses getent (NSS-aware: honours
+# /etc/hosts and nsswitch.conf, same resolution path applications use)
+# rather than dig, since dig/bind-utils may not be installed.
+resolve_ipv4_addresses() {
+  local host="$1"
+  getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u
+}
+
+# Static IPv4 CIDR ranges covering Cloudflare's documented Tunnel edge
+# addresses (region1.v2.argotunnel.com / region2.v2.argotunnel.com,
+# TCP/UDP port 7844), for the default (non-US, non-FedRAMP) region. See:
+# https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/tunnel-with-firewall/
+readonly CLOUDFLARE_TUNNEL_EDGE_PREFIXES=("198.41.192.0/24" "198.41.200.0/24")
+
+# Hostnames cloudflared also talks to that should be routed the same
+# way as the tunnel edge itself: api.cloudflare.com (software update
+# checks) and cfd-features.argotunnel.com (QUIC datagram version
+# negotiation, resolved as a DNS TXT lookup but the A/AAAA lookup of
+# the same name is what actually gets routed here). See:
+# https://developers.cloudflare.com/tunnel/configuration/
+readonly CLOUDFLARE_TUNNEL_EDGE_HOSTNAMES=("api.cloudflare.com" "cfd-features.argotunnel.com")
+
+# Fixed IPv4 host addresses (Cloudflare's public DNS resolver) to route
+# the same way as the tunnel edge.
+readonly CLOUDFLARE_TUNNEL_EDGE_HOSTS=("1.1.1.1" "1.0.0.1")
+
+# Route Cloudflare Tunnel's edge ranges, the resolved addresses of
+# api.cloudflare.com / cfd-features.argotunnel.com, and 1.1.1.1/1.0.0.1
+# out the edge interface (e.g. eth1), via that interface's own gateway.
+# Also marks the edge connection ipv4.never-default so NetworkManager
+# never assigns it the default route (belt-and-suspenders on top of the
+# static routes: the default route and every other destination --
+# general internet egress, RFC 1918 ranges, etc. -- stay on the primary
+# interface, normally eth0, untouched).
+#
+# Applied via NetworkManager (nmcli) so changes survive reboots. Uses
+# "nmcli device reapply" rather than "connection up" so changes take
+# effect without a full connection bounce.
+#
+# Idempotent and safe to re-run: re-running the setup script, or the
+# "Refresh Cloudflare edge routes" management-tool action, picks up any
+# newly-resolved IPs for the hostnames above without disturbing routes
+# that are already present.
+configure_edge_routing() {
+  local edge_iface="$1"
+
+  command -v nmcli >/dev/null 2>&1 || {
+    warn "nmcli not found; skipping Cloudflare Tunnel edge static routes for ${edge_iface}."
+    return 0
+  }
+
+  local primary_iface
+  primary_iface="$(default_route_iface)"
+  if [[ -z "$primary_iface" ]]; then
+    warn "Could not determine the interface currently holding the default route; skipping Cloudflare Tunnel edge static routes."
+    return 0
+  fi
+  if [[ "$primary_iface" == "$edge_iface" ]]; then
+    info "${edge_iface} already holds the default route; no separate routing needed for Cloudflare Tunnel edge ranges, skipping."
+    return 0
+  fi
+
+  local edge_gateway
+  edge_gateway="$(default_route_gateway_on_iface "$edge_iface")"
+  if [[ -z "$edge_gateway" ]]; then
+    warn "Could not determine a gateway on ${edge_iface} (no default route present on it); skipping Cloudflare Tunnel edge static routes."
+    return 0
+  fi
+
+  local edge_conn
+  edge_conn="$(nm_connection_for_iface "$edge_iface")"
+  if [[ -z "$edge_conn" ]]; then
+    warn "Could not resolve a NetworkManager connection for ${edge_iface}; skipping Cloudflare Tunnel edge static routes."
+    return 0
+  fi
+
+  # Build the full list of host routes (CIDR prefixes) to add: the
+  # fixed Cloudflare Tunnel edge /24s, the fixed 1.1.1.1/1.0.0.1 hosts,
+  # and whatever api.cloudflare.com / cfd-features.argotunnel.com
+  # currently resolve to (as /32s). Resolution failures are warned
+  # about but do not abort the rest of the routing setup.
+  local edge_prefixes=("${CLOUDFLARE_TUNNEL_EDGE_PREFIXES[@]}")
+  local host_ip
+  for host_ip in "${CLOUDFLARE_TUNNEL_EDGE_HOSTS[@]}"; do
+    edge_prefixes+=("${host_ip}/32")
+  done
+
+  local hostname resolved_ips ip
+  for hostname in "${CLOUDFLARE_TUNNEL_EDGE_HOSTNAMES[@]}"; do
+    resolved_ips="$(resolve_ipv4_addresses "$hostname")"
+    if [[ -z "$resolved_ips" ]]; then
+      warn "Could not resolve ${hostname} to an IPv4 address; skipping its route for now."
+      continue
+    fi
+    while IFS= read -r ip; do
+      [[ -n "$ip" ]] && edge_prefixes+=("${ip}/32")
+    done <<<"$resolved_ips"
+  done
+
+  echo
+  info "Planned network changes so this host reaches Cloudflare Tunnel edge servers via ${edge_iface}, while everything else (including the public internet and RFC 1918 destinations) keeps using ${primary_iface} unchanged:"
+  info "  - Add static routes via ${edge_gateway} on '${edge_conn}' (${edge_iface}) for: ${edge_prefixes[*]}"
+  info "  - Set ipv4.never-default=yes on '${edge_conn}' (${edge_iface}) so NetworkManager never assigns it the default route"
+  read -r -p "Apply these network changes now? [y/N]: " confirm_routing
+  if [[ "${confirm_routing,,}" != "y" ]]; then
+    warn "Skipping Cloudflare Tunnel edge routing changes at your request."
+    return 0
+  fi
+
+  local existing_routes prefix route_changed=0
+  existing_routes="$(nmcli -t -g ipv4.routes connection show "$edge_conn" 2>/dev/null)"
+  for prefix in "${edge_prefixes[@]}"; do
+    if [[ "$existing_routes" == *"${prefix}"* ]]; then
+      info "Route for ${prefix} already present on '${edge_conn}', leaving as-is."
+      continue
+    fi
+    info "Adding route ${prefix} via ${edge_gateway} to '${edge_conn}'"
+    nmcli connection modify "$edge_conn" +ipv4.routes "${prefix} ${edge_gateway}" \
+      || { warn "Failed to add route ${prefix} to '${edge_conn}'"; continue; }
+    route_changed=1
+  done
+
+  local current_never_default
+  current_never_default="$(nmcli -t -g ipv4.never-default connection show "$edge_conn" 2>/dev/null)"
+  if [[ "${current_never_default,,}" != "yes" ]]; then
+    info "Setting ipv4.never-default=yes on '${edge_conn}' (${edge_iface})"
+    nmcli connection modify "$edge_conn" ipv4.never-default yes \
+      || { warn "Failed to set ipv4.never-default on '${edge_conn}'"; }
+    route_changed=1
+  else
+    info "ipv4.never-default already set on '${edge_conn}', leaving as-is."
+  fi
+
+  if [[ "$route_changed" == "1" ]]; then
+    nmcli device reapply "$edge_iface" \
+      || warn "Failed to reapply '${edge_conn}' on ${edge_iface}; changes are saved but may need 'nmcli connection up ${edge_conn}' (or a reboot) to take effect."
+  fi
+
+  echo
+  info "Resulting IPv4 routing table:"
+  ip -4 route show >&2
+}
+
+# Recover the edge interface name for the current instance from its
+# Quadlet .container file (written by create_quadlet_rootless() as
+# "Network=pasta:-i,<iface>"), without re-prompting the operator.
+edge_iface_from_container_file() {
+  [[ -f "$CONTAINER_FILE" ]] || { warn "Container unit not found: ${CONTAINER_FILE}"; return 1; }
+  local iface
+  iface="$(grep -Eo 'pasta:-i,[^[:space:]]+' "$CONTAINER_FILE" 2>/dev/null | sed -E 's/^pasta:-i,//' | head -n1)"
+  if [[ -z "$iface" ]]; then
+    warn "Could not determine the edge interface from ${CONTAINER_FILE} (no 'pasta:-i,<iface>' network line found)."
+    return 1
+  fi
+  echo "$iface"
 }
 
 # Run systemctl --user for a given user, setting XDG_RUNTIME_DIR so that
@@ -678,6 +920,14 @@ action_daemon_reload() {
   info "Daemon reload complete."
 }
 
+action_refresh_edge_routing() {
+  local edge_iface
+  edge_iface="$(edge_iface_from_container_file)" || return 0
+  echo
+  info "Refreshing Cloudflare Tunnel edge static routes on interface: ${edge_iface}"
+  configure_edge_routing "$edge_iface"
+}
+
 print_menu() {
   echo
   echo "=========================================="
@@ -691,6 +941,7 @@ print_menu() {
   echo "  6) Change tunnel token"
   echo "  7) Reload systemd --user daemon"
   echo "  8) Switch base username / prod-dev instance"
+  echo "  9) Refresh Cloudflare Tunnel edge static routes"
   echo "  q) Quit"
   echo
 }
@@ -711,7 +962,8 @@ main() {
       upgrade)       action_upgrade ;;
       change-token)  action_change_token ;;
       daemon-reload) action_daemon_reload ;;
-      *) die "Unknown action: ${1}. Valid actions: status, restart, stop, start, upgrade, change-token, daemon-reload" ;;
+      refresh-edge-routing) action_refresh_edge_routing ;;
+      *) die "Unknown action: ${1}. Valid actions: status, restart, stop, start, upgrade, change-token, daemon-reload, refresh-edge-routing" ;;
     esac
     exit 0
   fi
@@ -728,6 +980,7 @@ main() {
       6) action_change_token ;;
       7) action_daemon_reload ;;
       8) resolve_instance ;;
+      9) action_refresh_edge_routing ;;
       q|Q) info "Exiting."; exit 0 ;;
       *) warn "Invalid selection: ${choice}" ;;
     esac
@@ -969,6 +1222,7 @@ main() {
   #-----------------------------------------------------------------------
   info "Installing cloudflared aliases for user ${CF_USER}"
   : >/etc/profile.d/cloudflared-aliases.sh
+  echo 'export PATH="/usr/local/sbin:$PATH"' >>/etc/profile.d/cloudflared-aliases.sh
   write_cloudflared_aliases "${CF_USER}" "cloudflared" ""
 
   if [[ "${INSTALL_DEV,,}" == "y" ]]; then
