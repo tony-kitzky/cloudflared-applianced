@@ -205,6 +205,36 @@ configure_edge_routing() {
     done <<<"$resolved_ips"
   done
 
+  # Also route this host's currently configured DNS resolver(s) via the
+  # edge gateway. Once ipv4.never-default is set below, the edge
+  # interface loses its implicit default-route path to anything not
+  # explicitly listed here -- including the resolver cloudflared and its
+  # container need to resolve region1/region2.v2.argotunnel.com (SRV
+  # lookup) and the Cloudflare Tunnel edge hostnames above. On AWS this
+  # is normally the VPC's own Route 53 Resolver (VPC CIDR base + 2, e.g.
+  # 172.31.0.2 for a 172.31.0.0/16 VPC); reading /etc/resolv.conf
+  # instead of hardcoding that convention keeps this working on non-AWS
+  # hosts and any other resolver setup too. See:
+  # https://docs.aws.amazon.com/vpc/latest/userguide/AmazonDNS-concepts.html
+  local resolver_ip
+  while IFS= read -r resolver_ip; do
+    [[ -n "$resolver_ip" ]] && edge_prefixes+=("${resolver_ip}/32")
+  done < <(awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
+
+  # De-duplicate edge_prefixes: a resolv.conf nameserver may coincide
+  # with an already-listed fixed host (e.g. 1.1.1.1), and re-running
+  # this function can otherwise queue the same prefix twice in one
+  # pass, which would attempt a redundant (harmless but noisy) nmcli
+  # +ipv4.routes call below.
+  local -A seen_prefixes=()
+  local deduped_prefixes=()
+  for prefix in "${edge_prefixes[@]}"; do
+    [[ -n "${seen_prefixes[$prefix]:-}" ]] && continue
+    seen_prefixes["$prefix"]=1
+    deduped_prefixes+=("$prefix")
+  done
+  edge_prefixes=("${deduped_prefixes[@]}")
+
   echo
   info "Planned network changes so this host reaches Cloudflare Tunnel edge servers via ${edge_iface}, while everything else (including the public internet and RFC 1918 destinations) keeps using ${primary_iface} unchanged:"
   info "  - Add static routes via ${edge_gateway} on '${edge_conn}' (${edge_iface}) for: ${edge_prefixes[*]}"
@@ -556,6 +586,36 @@ configure_edge_routing() {
       [[ -n "$ip" ]] && edge_prefixes+=("${ip}/32")
     done <<<"$resolved_ips"
   done
+
+  # Also route this host's currently configured DNS resolver(s) via the
+  # edge gateway. Once ipv4.never-default is set below, the edge
+  # interface loses its implicit default-route path to anything not
+  # explicitly listed here -- including the resolver cloudflared and its
+  # container need to resolve region1/region2.v2.argotunnel.com (SRV
+  # lookup) and the Cloudflare Tunnel edge hostnames above. On AWS this
+  # is normally the VPC's own Route 53 Resolver (VPC CIDR base + 2, e.g.
+  # 172.31.0.2 for a 172.31.0.0/16 VPC); reading /etc/resolv.conf
+  # instead of hardcoding that convention keeps this working on non-AWS
+  # hosts and any other resolver setup too. See:
+  # https://docs.aws.amazon.com/vpc/latest/userguide/AmazonDNS-concepts.html
+  local resolver_ip
+  while IFS= read -r resolver_ip; do
+    [[ -n "$resolver_ip" ]] && edge_prefixes+=("${resolver_ip}/32")
+  done < <(awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
+
+  # De-duplicate edge_prefixes: a resolv.conf nameserver may coincide
+  # with an already-listed fixed host (e.g. 1.1.1.1), and re-running
+  # this function can otherwise queue the same prefix twice in one
+  # pass, which would attempt a redundant (harmless but noisy) nmcli
+  # +ipv4.routes call below.
+  local -A seen_prefixes=()
+  local deduped_prefixes=()
+  for prefix in "${edge_prefixes[@]}"; do
+    [[ -n "${seen_prefixes[$prefix]:-}" ]] && continue
+    seen_prefixes["$prefix"]=1
+    deduped_prefixes+=("$prefix")
+  done
+  edge_prefixes=("${deduped_prefixes[@]}")
 
   echo
   info "Planned network changes so this host reaches Cloudflare Tunnel edge servers via ${edge_iface}, while everything else (including the public internet and RFC 1918 destinations) keeps using ${primary_iface} unchanged:"
