@@ -897,6 +897,34 @@ repair_pasta_network_line() {
   fi
 }
 
+# Ensure the Quadlet .container unit's Exec= line pins the tunnel
+# transport to "--protocol quic". Installs created before this flag was
+# added have no such option in their Exec= line at all; called from
+# action_upgrade so existing deployments pick it up without a full
+# uninstall/reinstall.
+repair_exec_protocol_flag() {
+  [[ -f "$CONTAINER_FILE" ]] || { warn "Container unit not found, skipping protocol flag fix: ${CONTAINER_FILE}"; return 0; }
+
+  local existing_exec_line
+  existing_exec_line="$(grep -E '^Exec=' "$CONTAINER_FILE" 2>/dev/null || true)"
+  [[ -n "$existing_exec_line" ]] || { warn "No Exec= line found in ${CONTAINER_FILE}; skipping protocol flag fix."; return 0; }
+
+  if [[ "$existing_exec_line" == *"--protocol"* ]]; then
+    info "Exec= line already has a --protocol flag (${existing_exec_line}); leaving it as-is."
+    return 0
+  fi
+
+  local desired_exec_line="${existing_exec_line/--no-autoupdate/--no-autoupdate --protocol quic}"
+  if [[ "$desired_exec_line" == "$existing_exec_line" ]]; then
+    # --no-autoupdate wasn't present to anchor on; append the flag right
+    # after "Exec=tunnel" instead.
+    desired_exec_line="${existing_exec_line/Exec=tunnel/Exec=tunnel --protocol quic}"
+  fi
+
+  info "Setting ${desired_exec_line} in ${CONTAINER_FILE}"
+  sed -i -E "s#^Exec=.*#${desired_exec_line}#" "$CONTAINER_FILE"
+}
+
 #------------------------------------------------------------------------------
 # 5) Upgrade the cloudflared container
 #------------------------------------------------------------------------------
@@ -945,6 +973,7 @@ action_upgrade() {
   chmod 0600 "${IMAGE_DROPIN}"
 
   repair_pasta_network_line "${current_edge_bind_address}"
+  repair_exec_protocol_flag
 
   info "Reloading systemd --user daemon for user: ${CF_USER}"
   user_systemctl "$CF_USER" daemon-reload || die "Failed to reload user daemon"
@@ -1023,7 +1052,7 @@ print_menu() {
   echo "  2) Restart container"
   echo "  3) Stop container"
   echo "  4) Start container"
-  echo "  5) Upgrade container (change image tag, repair pasta network line)"
+  echo "  5) Upgrade container (change image tag, repair pasta network line and protocol flag)"
   echo "  6) Change tunnel token"
   echo "  7) Reload systemd --user daemon"
   echo "  8) Switch base username / prod-dev instance"
@@ -1139,7 +1168,7 @@ After=network-online.target
 
 [Container]
 ContainerName=${container_name}
-Exec=tunnel --no-autoupdate run
+Exec=tunnel --no-autoupdate --protocol quic run
 Network=pasta:-i,${edge_iface}
 
 [Service]
