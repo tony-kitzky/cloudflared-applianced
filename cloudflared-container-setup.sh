@@ -13,11 +13,10 @@
 #     instance always runs as "<base>-prod" (created if missing):
 #      a) cloudflared image tag
 #      b) cloudflared tunnel token (dashboard-generated)
-#  3) OPTIONAL: prompt to also install a second "dev" instance, which
-#     always runs as "<base>-dev" (a distinct account from prod):
-#      a) cloudflared image tag
-#      b) cloudflared tunnel token
-#  4) Prompt once (shared by both prod and dev) for the network interface
+#     OPTIONAL: prompt to also install a second "dev" instance, which
+#     always runs as "<base>-dev" (a distinct account from prod).
+#
+#  3) Prompt once (shared by both prod and dev) for the network interface
 #     the container should use (passed to pasta as "-i <iface>" so pasta
 #     copies that interface's address/routes into the container
 #     namespace -- see create_quadlet_rootless). Only prompted when the
@@ -26,20 +25,20 @@
 #     handed to the container via pasta and left untouched on the host
 #     routing table -- no static routes or ipv4.never-default changes
 #     are made to it (see container_iface / create_quadlet_rootless).
-#  5) Enable persistent journaling + per-user journals
-#  6) Enable boot-start for user services (linger) for each instance's user
-#  7) Write /etc/sysctl.d/99-cloudflared.conf to update system limits for ping users and udp socket buffers
-#  8) Pull cloudflared image (fully-qualified docker.io/cloudflare/cloudflared:<tag>) per instance
-#  9) Create Quadlet base + drop-ins per instance:
+#  4) Enable persistent journaling + per-user journals
+#  5) Enable boot-start for user services (linger) for each instance's user
+#  6) Write /etc/sysctl.d/99-cloudflared.conf to update system limits for ping users and udp socket buffers
+#  7) Pull cloudflared image (fully-qualified docker.io/cloudflare/cloudflared:<tag>) per instance
+#  8) Create Quadlet base + drop-ins per instance:
 #      - prod unit: cloudflared.service (container file: cloudflared.container), user "<base>-prod"
 #      - dev unit:  cloudflared-dev.service (container file: cloudflared-dev.container), user "<base>-dev"
 #      - dev drop-in files are suffixed "-dev" to keep them unambiguous
-# 10) Start each instance's systemd --user service
-# 11) Install a single merged /usr/local/sbin/cloudflared-container
+#  9) Start each instance's systemd --user service
+# 10) Install a single merged /usr/local/sbin/cloudflared-container
 #     management command (menu-driven status/restart/upgrade tool; usable
 #     by any sudoer). It prompts for the base username and prod/dev
 #     instance at startup, and again from its "switch" menu item.
-# 12) Write /etc/profile.d/cloudflare-alias.sh (aliases for both instances,
+# 11) Write /etc/profile.d/cloudflare-alias.sh (aliases for both instances,
 #     if dev was installed)
 #
 # Notes:
