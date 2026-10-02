@@ -16,12 +16,18 @@
 #  3) Disable linger for the instance's user
 #  4) Remove /etc/sysctl.d/99-cloudflared.conf (ping_group_range, UDP buffers)
 #     -- shared by both instances, removed once
-#  5) Policy routing cleanup (legacy) -- ALWAYS runs and auto-detects
+#  5) Legacy policy-routing cleanup -- ALWAYS runs and auto-detects
 #     whatever is present, regardless of which interface it's on or
-#     whether setup put it there. No prompt needed; every step is a
-#     no-op if nothing matches. Covers an older setup script design
-#     (ip-rule/route-table based) kept here for hosts set up before the
-#     current nmcli-static-route design (see 5b):
+#     whether the CURRENT setup script put it there. No prompt needed;
+#     every step is a no-op if nothing matches. The current
+#     cloudflared-container-setup.sh no longer does any host-level
+#     interface/routing configuration at all -- the container's chosen
+#     interface is isolated entirely via pasta ("-i"/"--outbound-if4"/
+#     "--outbound-if6" on the Quadlet Network= line), with no static
+#     routes, policy-routing tables, or NetworkManager changes on the
+#     host side. This step (and 5b below) exist purely to clean up
+#     hosts that were set up by an OLDER version of the setup script,
+#     before it adopted the pasta-isolation design:
 #      - remove any ip rule that routes into table "origin"
 #      - remove any RFC1918 routes from route-table "origin"
 #      - remove the "origin" entry from /etc/iproute2/rt_tables
@@ -29,15 +35,18 @@
 #        persistence file that references the origin table
 #      - restore any NetworkManager profile with ipv4.never-default yes
 #        (re-enable default-route eligibility; gateway is not restored
-#        since setup does not record the original value)
-#  5b) Cloudflare Tunnel edge static routes cleanup -- ALWAYS runs.
-#     Reverses the current configure_edge_routing() design: auto-detects
-#     the NetworkManager connection with ipv4.never-default=yes (the
-#     edge interface's connection), clears all of its ipv4.routes
+#        since the old setup script did not record the original value)
+#  5b) Legacy Cloudflare Tunnel edge static routes cleanup -- ALWAYS
+#     runs. Reverses the OLDER configure_edge_routing() design (removed
+#     from the current setup script) by auto-detecting the
+#     NetworkManager connection with ipv4.never-default=yes (the old
+#     edge interface's connection), clearing all of its ipv4.routes
 #     entries (the Cloudflare Tunnel edge /24s, 1.1.1.1/1.0.0.1, and
 #     the resolved api.cloudflare.com / cfd-features.argotunnel.com
-#     addresses), and resets ipv4.never-default to no. Gateway is not
-#     restored since setup does not record the original value.
+#     addresses), and resetting ipv4.never-default to no. Gateway is
+#     not restored since the old setup script did not record the
+#     original value. A no-op on hosts set up by the current
+#     pasta-isolation design, since it never touches any of this.
 #  6) Remove /etc/systemd/journald.conf.d/99-persistent.conf (persistent
 #     journaling) and restart journald if requested
 #  7) Remove /etc/profile.d/cloudflared-aliases.sh (contains both prod and
@@ -55,12 +64,18 @@
 #  - Packages installed by setup (podman, passt) -- shared system packages,
 #    not safe to assume they're unused elsewhere. Removal command is printed
 #    at the end for you to run manually if desired.
-#  - eth0's default route / gateway -- setup never modifies eth0, so
-#    uninstall never touches it either.
-#  - The edge connection's original gateway value -- setup does not
-#    record it before ipv4.never-default strips it, so it isn't
-#    restored; set it manually afterward if the interface still needs
-#    a default route: nmcli con mod <connection> ipv4.gateway <ip>
+#  - The host's routing table / NetworkManager connections for the
+#    container's interface -- the current setup script never modifies
+#    these in the first place (the container is isolated entirely via
+#    pasta -i/--outbound-if4/--outbound-if6), so there is nothing of
+#    the current design for uninstall to reverse here. Steps 5/5b
+#    above are retained only to clean up hosts set up by an older
+#    version of the setup script that DID modify host routing.
+#  - The legacy edge connection's original gateway value (steps 5/5b,
+#    old hosts only) -- the old setup script did not record it before
+#    ipv4.never-default stripped it, so it isn't restored; set it
+#    manually afterward if the interface still needs a default route:
+#    nmcli con mod <connection> ipv4.gateway <ip>
 #
 # Usage:
 #   sudo bash cloudflared-container-uninstall.sh
@@ -231,15 +246,21 @@ remove_sysctl_cloudflared() {
 }
 
 #------------------------------------------------------------------------------
-# 5) Remove any leftover dual-NIC policy routing, unconditionally.
+# 5) LEGACY: remove any leftover dual-NIC policy routing, unconditionally.
 #
-# This does NOT depend on the setup script having created these -- it
-# actively detects and removes anything matching the "origin" policy
-# routing pattern (ip rules, routes, rt_tables entry, persistence files,
-# and NetworkManager never-default flags), regardless of which interface
-# they reference or whether the interface still exists. Safe to run even
-# if none of this is present; every removal step is a no-op when nothing
-# matches.
+# The current setup script never creates any of this -- the container's
+# interface is isolated purely via pasta (-i/--outbound-if4/
+# --outbound-if6), with no host-level routing changes at all. This
+# function exists only to clean up hosts set up by an older version of
+# the setup script, which used an ip-rule/route-table policy-routing
+# design. It does NOT depend on the setup script having created these
+# -- it actively detects and removes anything matching the "origin"
+# policy routing pattern (ip rules, routes, rt_tables entry,
+# persistence files, and NetworkManager never-default flags),
+# regardless of which interface they reference or whether the
+# interface still exists. Safe to run even if none of this is present
+# (e.g. on a host set up by the current pasta-isolation design); every
+# removal step is a no-op when nothing matches.
 #------------------------------------------------------------------------------
 remove_policy_routing_two_nic() {
   local rt_name="origin"
@@ -325,26 +346,32 @@ remove_policy_routing_two_nic() {
 }
 
 #------------------------------------------------------------------------------
-# 5b) Remove Cloudflare Tunnel edge static routes and ipv4.never-default,
-#     as applied by configure_edge_routing() in
-#     cloudflared-container-setup.sh (nmcli +ipv4.routes / ipv4.never-default
-#     on the edge interface's own NetworkManager connection -- NOT the
-#     origin policy-routing-table model handled above). Auto-detects the
-#     edge connection by scanning every connection's ipv4.routes for the
-#     Cloudflare Tunnel /24 markers (198.41.192.0/24 / 198.41.200.0/24),
-#     which every version of the setup script has always added -- this is
-#     more reliable than relying on ipv4.never-default=yes alone, since
-#     that flag was only added in a later version of the setup script and
-#     hosts set up before it will have the static routes but never set
-#     that flag. Also includes any connection that DOES have
-#     ipv4.never-default=yes, in case a future version of the setup
-#     script sets that flag without also matching these exact prefixes.
-#     A no-op if neither is found. Clears the entire ipv4.routes property
-#     on each matched connection (setting it to "" resets it, per
-#     NetworkManager's nmcli reference), since setup is the only thing
-#     expected to add routes there and route contents (e.g.
-#     api.cloudflare.com's resolved IPs) can drift over time -- easier
-#     and more reliable than removing individual entries.
+# 5b) LEGACY: remove Cloudflare Tunnel edge static routes and
+#     ipv4.never-default, as applied by the OLD configure_edge_routing()
+#     design that has since been removed from cloudflared-container-setup.sh
+#     (nmcli +ipv4.routes / ipv4.never-default on the edge interface's
+#     own NetworkManager connection -- NOT the origin policy-routing-table
+#     model handled above). The current setup script isolates the
+#     container's interface entirely via pasta and never touches
+#     NetworkManager or the host routing table, so this function is a
+#     no-op on hosts set up by the current design; it only matters for
+#     hosts set up by an older version of the script. Auto-detects the
+#     old edge connection by scanning every connection's ipv4.routes for
+#     the Cloudflare Tunnel /24 markers (198.41.192.0/24 /
+#     198.41.200.0/24), which every pre-pasta version of the setup
+#     script added -- this is more reliable than relying on
+#     ipv4.never-default=yes alone, since that flag was only added in a
+#     later (still pre-pasta) version and hosts set up before it will
+#     have the static routes but never set that flag. Also includes any
+#     connection that DOES have ipv4.never-default=yes, in case some
+#     older setup revision set that flag without matching these exact
+#     prefixes. A no-op if neither is found. Clears the entire
+#     ipv4.routes property on each matched connection (setting it to ""
+#     resets it, per NetworkManager's nmcli reference), since the old
+#     setup design was the only thing expected to add routes there and
+#     route contents (e.g. api.cloudflare.com's resolved IPs) could
+#     drift over time -- easier and more reliable than removing
+#     individual entries.
 #------------------------------------------------------------------------------
 remove_edge_static_routes() {
   command -v nmcli >/dev/null 2>&1 || {
@@ -607,14 +634,19 @@ main() {
   # 4. Remove sysctl config (shared, once)
   remove_sysctl_cloudflared
 
-  # 5. Remove any leftover policy routing -- always runs, auto-detects
-  # whatever is present rather than relying on the user to know if/where
-  # it was configured.
+  # 5. LEGACY: remove any leftover policy routing from an older setup
+  # script version -- always runs, auto-detects whatever is present
+  # rather than relying on the user to know if/where it was
+  # configured. A no-op on hosts set up by the current pasta-isolation
+  # design, which never creates any of this.
   echo
   remove_policy_routing_two_nic
 
-  # 5b. Remove Cloudflare Tunnel edge static routes (nmcli +ipv4.routes /
-  # ipv4.never-default) -- always runs, auto-detects the edge connection.
+  # 5b. LEGACY: remove Cloudflare Tunnel edge static routes
+  # (nmcli +ipv4.routes / ipv4.never-default) left by an older setup
+  # script version -- always runs, auto-detects the old edge
+  # connection. A no-op on hosts set up by the current pasta-isolation
+  # design, which never touches NetworkManager or host routing.
   echo
   remove_edge_static_routes
 
@@ -670,8 +702,8 @@ main() {
     fi
   fi
   echo "  - /etc/sysctl.d/99-cloudflared.conf removed"
-  echo "  - Any leftover legacy policy routing removed (ip rules, origin table routes, rt_tables entry, persistence files, NetworkManager profile -- auto-detected)"
-  echo "  - Cloudflare Tunnel edge static routes and ipv4.never-default removed from the edge NetworkManager connection (auto-detected)"
+  echo "  - Any leftover legacy policy routing removed, if present (ip rules, origin table routes, rt_tables entry, persistence files, NetworkManager profile -- auto-detected; no-op on hosts set up by the current pasta-isolation design)"
+  echo "  - Any leftover legacy Cloudflare Tunnel edge static routes and ipv4.never-default removed, if present (auto-detected; no-op on hosts set up by the current pasta-isolation design)"
   [[ "$REMOVE_JOURNAL" == "y" ]] && echo "  - Persistent journaling configuration removed"
   echo "  - /etc/profile.d/cloudflared-aliases.sh removed"
   echo "  - /usr/local/sbin/cloudflared-container management command removed"
@@ -685,7 +717,7 @@ main() {
   info "Not removed (shared system state, left for you to review):"
   echo "  - Packages: podman, passt -- remove manually if unused elsewhere:"
   echo "      sudo dnf remove podman passt"
-  echo "  - Any policy-routed interface's original NetworkManager gateway value (not recorded) -- set manually if needed:"
+  echo "  - On hosts set up by an older, pre-pasta version of the setup script: any policy-routed interface's original NetworkManager gateway value (not recorded) -- set manually if needed:"
   echo "      nmcli con mod <connection> ipv4.gateway <ip>"
   echo
   info "Verify final state:"
