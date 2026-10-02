@@ -18,11 +18,14 @@
 #      a) cloudflared image tag
 #      b) cloudflared tunnel token
 # 3b) Prompt once (shared by both prod and dev) for the network interface
-#     to bind outgoing Cloudflare Edge connections to. The interface's
-#     IPv4 address is written as TUNNEL_EDGE_BIND_ADDRESS; TUNNEL_EDGE_IP_VERSION
-#     is always hardcoded to "4" (no prompt). Both env vars are written
-#     into each instance's 40-image[-dev].conf drop-in, using the same
-#     values for prod and dev.
+#     the container should use (passed to pasta as "-i <iface>" so pasta
+#     copies that interface's address/routes into the container
+#     namespace -- see create_quadlet_rootless). Only prompted when the
+#     host has more than one physical Ethernet adapter; with exactly one,
+#     it's auto-selected with no prompt. The chosen interface is fully
+#     handed to the container via pasta and left untouched on the host
+#     routing table -- no static routes or ipv4.never-default changes
+#     are made to it (see container_iface / create_quadlet_rootless).
 #  4) Enable persistent journaling + per-user journals
 #  5) Enable boot-start for user services (linger) for each instance's user
 #  6) Write /etc/sysctl.d/99-cloudflared.conf to update system limits for ping users and udp socket buffers
@@ -45,10 +48,20 @@
 #    sets XDG_RUNTIME_DIR to avoid "Failed to connect to bus: No medium found".
 #  - The "prod" and "dev" instances always run under distinct rootless
 #    users, "<base>-prod" and "<base>-dev", derived from one base username.
-#  - TUNNEL_EDGE_IP_VERSION/TUNNEL_EDGE_BIND_ADDRESS are set once from a
-#    single interface selection and shared by both instances; the
-#    management command's upgrade action preserves them across image
-#    tag changes instead of resetting the drop-in file.
+#  - The container interface (container_iface) is selected once and
+#    shared by both instances; it is passed to pasta via
+#    "Network=pasta:-i,<iface>,--outbound-if4,<iface>,--outbound-if6,<iface>"
+#    in each instance's Quadlet .container file only. -i controls what
+#    the container's own namespace sees (addresses/routes/gateway
+#    copied in via pasta's "--config-net"); --outbound-if4/6 separately
+#    pin pasta's own host-side forwarding sockets to the same
+#    interface, since -i alone does not do that -- left unset, those
+#    sockets would fall back to whatever the host's main routing table
+#    prefers (its default route), which can be a different interface
+#    entirely. With both set, the container is isolated end-to-end:
+#    its namespace only knows this interface, and pasta's real
+#    host-side traffic for it can only egress this interface. The
+#    host's own routing table for that interface is never modified.
 #
 # Usage:
 #   sudo bash cloudflared-container-setup.sh
@@ -64,219 +77,26 @@ require_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo bash $0"; }
 
 iface_exists() { ip link show dev "$1" >/dev/null 2>&1; }
 
-# Print the first IPv4 address (no CIDR suffix) assigned to the given
-# interface, or return non-zero if none is found.
-iface_ipv4_address() {
-  local iface="$1"
-  ip -4 -o addr show dev "$iface" scope global 2>/dev/null \
-    | awk '{print $4}' | cut -d/ -f1 | head -n1
-}
-
-# Print the interface currently holding the default (0.0.0.0/0) IPv4
-# route, or nothing if there isn't one.
-default_route_iface() {
-  ip -4 route show default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1
-}
-
-# Print the gateway of the default IPv4 route on the given interface, or
-# nothing if that interface has no default route.
-default_route_gateway_on_iface() {
-  local iface="$1"
-  ip -4 route show default dev "$iface" 2>/dev/null \
-    | awk '{for (i=1;i<=NF;i++) if ($i=="via") print $(i+1)}' | head -n1
-}
-
-# Print the NetworkManager connection name that currently owns the given
-# interface, or nothing if NetworkManager doesn't manage it (or isn't
-# running).
-nm_connection_for_iface() {
-  local iface="$1"
-  command -v nmcli >/dev/null 2>&1 || return 0
-  nmcli -t -f DEVICE,CONNECTION device status 2>/dev/null \
-    | awk -F: -v d="$iface" '$1==d {print $2; exit}'
-}
-
-# Print every distinct IPv4 address a hostname resolves to (one per
-# line), or nothing on failure. Uses getent (NSS-aware: honours
-# /etc/hosts and nsswitch.conf, same resolution path applications use)
-# rather than dig, since dig/bind-utils may not be installed.
-resolve_ipv4_addresses() {
-  local host="$1"
-  # getent exits non-zero when a hostname has no A/AAAA record (e.g.
-  # cfd-features.argotunnel.com, which is resolved elsewhere as a TXT
-  # record). Under `set -o pipefail`, that non-zero status would
-  # otherwise propagate out of this pipeline and -- because callers
-  # capture this function's output via command substitution with no
-  # `|| true` guard of their own -- kill the whole script under
-  # `set -e` before they ever get a chance to check for an empty
-  # result. The `|| true` neutralizes that; callers already treat
-  # empty output as "could not resolve" and warn/skip accordingly.
-  getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u || true
-}
-
-# Static IPv4 CIDR ranges covering Cloudflare's documented Tunnel edge
-# addresses (region1.v2.argotunnel.com / region2.v2.argotunnel.com,
-# TCP/UDP port 7844), for the default (non-US, non-FedRAMP) region. See:
-# https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/tunnel-with-firewall/
-readonly CLOUDFLARE_TUNNEL_EDGE_PREFIXES=("198.41.192.0/24" "198.41.200.0/24")
-
-# Hostnames cloudflared also talks to that should be routed the same
-# way as the tunnel edge itself: api.cloudflare.com (software update
-# checks) and cfd-features.argotunnel.com (QUIC datagram version
-# negotiation, resolved as a DNS TXT lookup but the A/AAAA lookup of
-# the same name is what actually gets routed here). See:
-# https://developers.cloudflare.com/tunnel/configuration/
-readonly CLOUDFLARE_TUNNEL_EDGE_HOSTNAMES=("api.cloudflare.com" "cfd-features.argotunnel.com")
-
-# Fixed IPv4 host addresses (Cloudflare's public DNS resolver) to route
-# the same way as the tunnel edge.
-readonly CLOUDFLARE_TUNNEL_EDGE_HOSTS=("1.1.1.1" "1.0.0.1")
-
-# Route Cloudflare Tunnel's edge ranges, the resolved addresses of
-# api.cloudflare.com / cfd-features.argotunnel.com, and 1.1.1.1/1.0.0.1
-# out the edge interface (e.g. eth1), via that interface's own gateway.
-# Also marks the edge connection ipv4.never-default so NetworkManager
-# never assigns it the default route (belt-and-suspenders on top of the
-# static routes: the default route and every other destination --
-# general internet egress, RFC 1918 ranges, etc. -- stay on the primary
-# interface, normally eth0, untouched).
-#
-# Applied via NetworkManager (nmcli) so changes survive reboots. Uses
-# "nmcli device reapply" rather than "connection up" so changes take
-# effect without a full connection bounce.
-#
-# Idempotent and safe to re-run: re-running the setup script, or the
-# "Refresh Cloudflare edge routes" management-tool action, picks up any
-# newly-resolved IPs for the hostnames above without disturbing routes
-# that are already present.
-configure_edge_routing() {
-  local edge_iface="$1"
-
-  command -v nmcli >/dev/null 2>&1 || {
-    warn "nmcli not found; skipping Cloudflare Tunnel edge static routes for ${edge_iface}."
-    return 0
-  }
-
-  local primary_iface
-  primary_iface="$(default_route_iface)"
-  if [[ -z "$primary_iface" ]]; then
-    warn "Could not determine the interface currently holding the default route; skipping Cloudflare Tunnel edge static routes."
-    return 0
-  fi
-  if [[ "$primary_iface" == "$edge_iface" ]]; then
-    info "${edge_iface} already holds the default route; no separate routing needed for Cloudflare Tunnel edge ranges, skipping."
-    return 0
-  fi
-
-  local edge_gateway
-  edge_gateway="$(default_route_gateway_on_iface "$edge_iface")"
-  if [[ -z "$edge_gateway" ]]; then
-    warn "Could not determine a gateway on ${edge_iface} (no default route present on it); skipping Cloudflare Tunnel edge static routes."
-    return 0
-  fi
-
-  local edge_conn
-  edge_conn="$(nm_connection_for_iface "$edge_iface")"
-  if [[ -z "$edge_conn" ]]; then
-    warn "Could not resolve a NetworkManager connection for ${edge_iface}; skipping Cloudflare Tunnel edge static routes."
-    return 0
-  fi
-
-  # Build the full list of host routes (CIDR prefixes) to add: the
-  # fixed Cloudflare Tunnel edge /24s, the fixed 1.1.1.1/1.0.0.1 hosts,
-  # and whatever api.cloudflare.com / cfd-features.argotunnel.com
-  # currently resolve to (as /32s). Resolution failures are warned
-  # about but do not abort the rest of the routing setup.
-  local edge_prefixes=("${CLOUDFLARE_TUNNEL_EDGE_PREFIXES[@]}")
-  local host_ip
-  for host_ip in "${CLOUDFLARE_TUNNEL_EDGE_HOSTS[@]}"; do
-    edge_prefixes+=("${host_ip}/32")
+# List physical Ethernet adapter names on this host, one per line.
+# Scans /sys/class/net for entries with a "device" symlink (i.e.
+# backed by a real PCI/virtual-NIC device, not a software construct)
+# whose ethtool-reported driver isn't one of the well-known
+# virtual/software interface drivers. This deliberately excludes lo,
+# veth*, docker/podman bridges, tunnel devices, and tap/pasta devices,
+# so only genuine NICs (eth0, eth1, ensX, enpXsY, ...) are counted --
+# used by main() to decide whether to prompt for container_iface at all.
+list_ethernet_ifaces() {
+  local dev sys_path driver
+  for sys_path in /sys/class/net/*; do
+    [[ -e "${sys_path}/device" ]] || continue
+    dev="$(basename "$sys_path")"
+    [[ "$dev" == "lo" ]] && continue
+    driver="$(basename "$(readlink -f "${sys_path}/device/driver" 2>/dev/null)" 2>/dev/null || true)"
+    case "$driver" in
+      veth|bridge|tun|tap|dummy|bonding) continue ;;
+    esac
+    echo "$dev"
   done
-
-  local hostname resolved_ips ip
-  for hostname in "${CLOUDFLARE_TUNNEL_EDGE_HOSTNAMES[@]}"; do
-    resolved_ips="$(resolve_ipv4_addresses "$hostname")"
-    if [[ -z "$resolved_ips" ]]; then
-      warn "Could not resolve ${hostname} to an IPv4 address; skipping its route for now."
-      continue
-    fi
-    while IFS= read -r ip; do
-      [[ -n "$ip" ]] && edge_prefixes+=("${ip}/32")
-    done <<<"$resolved_ips"
-  done
-
-  # Also route this host's currently configured DNS resolver(s) via the
-  # edge gateway. Once ipv4.never-default is set below, the edge
-  # interface loses its implicit default-route path to anything not
-  # explicitly listed here -- including the resolver cloudflared and its
-  # container need to resolve region1/region2.v2.argotunnel.com (SRV
-  # lookup) and the Cloudflare Tunnel edge hostnames above. On AWS this
-  # is normally the VPC's own Route 53 Resolver (VPC CIDR base + 2, e.g.
-  # 172.31.0.2 for a 172.31.0.0/16 VPC); reading /etc/resolv.conf
-  # instead of hardcoding that convention keeps this working on non-AWS
-  # hosts and any other resolver setup too. See:
-  # https://docs.aws.amazon.com/vpc/latest/userguide/AmazonDNS-concepts.html
-  local resolver_ip
-  while IFS= read -r resolver_ip; do
-    [[ -n "$resolver_ip" ]] && edge_prefixes+=("${resolver_ip}/32")
-  done < <(awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
-
-  # De-duplicate edge_prefixes: a resolv.conf nameserver may coincide
-  # with an already-listed fixed host (e.g. 1.1.1.1), and re-running
-  # this function can otherwise queue the same prefix twice in one
-  # pass, which would attempt a redundant (harmless but noisy) nmcli
-  # +ipv4.routes call below.
-  local -A seen_prefixes=()
-  local deduped_prefixes=()
-  for prefix in "${edge_prefixes[@]}"; do
-    [[ -n "${seen_prefixes[$prefix]:-}" ]] && continue
-    seen_prefixes["$prefix"]=1
-    deduped_prefixes+=("$prefix")
-  done
-  edge_prefixes=("${deduped_prefixes[@]}")
-
-  echo
-  info "Planned network changes so this host reaches Cloudflare Tunnel edge servers via ${edge_iface}, while everything else (including the public internet and RFC 1918 destinations) keeps using ${primary_iface} unchanged:"
-  info "  - Add static routes via ${edge_gateway} on '${edge_conn}' (${edge_iface}) for: ${edge_prefixes[*]}"
-  info "  - Set ipv4.never-default=yes on '${edge_conn}' (${edge_iface}) so NetworkManager never assigns it the default route"
-  read -r -p "Apply these network changes now? [y/N]: " confirm_routing
-  if [[ "${confirm_routing,,}" != "y" ]]; then
-    warn "Skipping Cloudflare Tunnel edge routing changes at your request."
-    return 0
-  fi
-
-  local existing_routes prefix route_changed=0
-  existing_routes="$(nmcli -t -g ipv4.routes connection show "$edge_conn" 2>/dev/null)"
-  for prefix in "${edge_prefixes[@]}"; do
-    if [[ "$existing_routes" == *"${prefix}"* ]]; then
-      info "Route for ${prefix} already present on '${edge_conn}', leaving as-is."
-      continue
-    fi
-    info "Adding route ${prefix} via ${edge_gateway} to '${edge_conn}'"
-    nmcli connection modify "$edge_conn" +ipv4.routes "${prefix} ${edge_gateway}" \
-      || { warn "Failed to add route ${prefix} to '${edge_conn}'"; continue; }
-    route_changed=1
-  done
-
-  local current_never_default
-  current_never_default="$(nmcli -t -g ipv4.never-default connection show "$edge_conn" 2>/dev/null)"
-  if [[ "${current_never_default,,}" != "yes" ]]; then
-    info "Setting ipv4.never-default=yes on '${edge_conn}' (${edge_iface})"
-    nmcli connection modify "$edge_conn" ipv4.never-default yes \
-      || { warn "Failed to set ipv4.never-default on '${edge_conn}'"; }
-    route_changed=1
-  else
-    info "ipv4.never-default already set on '${edge_conn}', leaving as-is."
-  fi
-
-  if [[ "$route_changed" == "1" ]]; then
-    nmcli device reapply "$edge_iface" \
-      || warn "Failed to reapply '${edge_conn}' on ${edge_iface}; changes are saved but may need 'nmcli connection up ${edge_conn}' (or a reboot) to take effect."
-  fi
-
-  echo
-  info "Resulting IPv4 routing table:"
-  ip -4 route show >&2
 }
 
 user_exists() { id "$1" >/dev/null 2>&1; }
@@ -438,233 +258,14 @@ user_home() { getent passwd "$1" | awk -F: '{print $6}'; }
 
 iface_exists() { ip link show dev "$1" >/dev/null 2>&1; }
 
-# Print the first IPv4 address (no CIDR suffix) assigned to the given
-# interface, or return non-zero if none is found.
-iface_ipv4_address() {
-  local iface="$1"
-  ip -4 -o addr show dev "$iface" scope global 2>/dev/null \
-    | awk '{print $4}' | cut -d/ -f1 | head -n1
-}
-
-# Print the interface that currently owns the given IPv4 address, or
-# nothing if no interface has it.
-iface_for_ipv4_address() {
-  local addr="$1"
-  ip -4 -o addr show scope global 2>/dev/null \
-    | awk -v a="$addr" '{split($4,parts,"/"); if (parts[1]==a) {print $2; exit}}'
-}
-
-# Print the interface currently holding the default (0.0.0.0/0) IPv4
-# route, or nothing if there isn't one.
-default_route_iface() {
-  ip -4 route show default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1
-}
-
-# Print the gateway of the default IPv4 route on the given interface, or
-# nothing if that interface has no default route.
-default_route_gateway_on_iface() {
-  local iface="$1"
-  ip -4 route show default dev "$iface" 2>/dev/null \
-    | awk '{for (i=1;i<=NF;i++) if ($i=="via") print $(i+1)}' | head -n1
-}
-
-# Print the NetworkManager connection name that currently owns the given
-# interface, or nothing if NetworkManager doesn't manage it (or isn't
-# running).
-nm_connection_for_iface() {
-  local iface="$1"
-  command -v nmcli >/dev/null 2>&1 || return 0
-  nmcli -t -f DEVICE,CONNECTION device status 2>/dev/null \
-    | awk -F: -v d="$iface" '$1==d {print $2; exit}'
-}
-
-# Print every distinct IPv4 address a hostname resolves to (one per
-# line), or nothing on failure. Uses getent (NSS-aware: honours
-# /etc/hosts and nsswitch.conf, same resolution path applications use)
-# rather than dig, since dig/bind-utils may not be installed.
-resolve_ipv4_addresses() {
-  local host="$1"
-  # getent exits non-zero when a hostname has no A/AAAA record (e.g.
-  # cfd-features.argotunnel.com, which is resolved elsewhere as a TXT
-  # record). Under `set -o pipefail`, that non-zero status would
-  # otherwise propagate out of this pipeline and -- because callers
-  # capture this function's output via command substitution with no
-  # `|| true` guard of their own -- kill the whole script under
-  # `set -e` before they ever get a chance to check for an empty
-  # result. The `|| true` neutralizes that; callers already treat
-  # empty output as "could not resolve" and warn/skip accordingly.
-  getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u || true
-}
-
-# Static IPv4 CIDR ranges covering Cloudflare's documented Tunnel edge
-# addresses (region1.v2.argotunnel.com / region2.v2.argotunnel.com,
-# TCP/UDP port 7844), for the default (non-US, non-FedRAMP) region. See:
-# https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/tunnel-with-firewall/
-readonly CLOUDFLARE_TUNNEL_EDGE_PREFIXES=("198.41.192.0/24" "198.41.200.0/24")
-
-# Hostnames cloudflared also talks to that should be routed the same
-# way as the tunnel edge itself: api.cloudflare.com (software update
-# checks) and cfd-features.argotunnel.com (QUIC datagram version
-# negotiation, resolved as a DNS TXT lookup but the A/AAAA lookup of
-# the same name is what actually gets routed here). See:
-# https://developers.cloudflare.com/tunnel/configuration/
-readonly CLOUDFLARE_TUNNEL_EDGE_HOSTNAMES=("api.cloudflare.com" "cfd-features.argotunnel.com")
-
-# Fixed IPv4 host addresses (Cloudflare's public DNS resolver) to route
-# the same way as the tunnel edge.
-readonly CLOUDFLARE_TUNNEL_EDGE_HOSTS=("1.1.1.1" "1.0.0.1")
-
-# Route Cloudflare Tunnel's edge ranges, the resolved addresses of
-# api.cloudflare.com / cfd-features.argotunnel.com, and 1.1.1.1/1.0.0.1
-# out the edge interface (e.g. eth1), via that interface's own gateway.
-# Also marks the edge connection ipv4.never-default so NetworkManager
-# never assigns it the default route (belt-and-suspenders on top of the
-# static routes: the default route and every other destination --
-# general internet egress, RFC 1918 ranges, etc. -- stay on the primary
-# interface, normally eth0, untouched).
-#
-# Applied via NetworkManager (nmcli) so changes survive reboots. Uses
-# "nmcli device reapply" rather than "connection up" so changes take
-# effect without a full connection bounce.
-#
-# Idempotent and safe to re-run: re-running the setup script, or the
-# "Refresh Cloudflare edge routes" management-tool action, picks up any
-# newly-resolved IPs for the hostnames above without disturbing routes
-# that are already present.
-configure_edge_routing() {
-  local edge_iface="$1"
-
-  command -v nmcli >/dev/null 2>&1 || {
-    warn "nmcli not found; skipping Cloudflare Tunnel edge static routes for ${edge_iface}."
-    return 0
-  }
-
-  local primary_iface
-  primary_iface="$(default_route_iface)"
-  if [[ -z "$primary_iface" ]]; then
-    warn "Could not determine the interface currently holding the default route; skipping Cloudflare Tunnel edge static routes."
-    return 0
-  fi
-  if [[ "$primary_iface" == "$edge_iface" ]]; then
-    info "${edge_iface} already holds the default route; no separate routing needed for Cloudflare Tunnel edge ranges, skipping."
-    return 0
-  fi
-
-  local edge_gateway
-  edge_gateway="$(default_route_gateway_on_iface "$edge_iface")"
-  if [[ -z "$edge_gateway" ]]; then
-    warn "Could not determine a gateway on ${edge_iface} (no default route present on it); skipping Cloudflare Tunnel edge static routes."
-    return 0
-  fi
-
-  local edge_conn
-  edge_conn="$(nm_connection_for_iface "$edge_iface")"
-  if [[ -z "$edge_conn" ]]; then
-    warn "Could not resolve a NetworkManager connection for ${edge_iface}; skipping Cloudflare Tunnel edge static routes."
-    return 0
-  fi
-
-  # Build the full list of host routes (CIDR prefixes) to add: the
-  # fixed Cloudflare Tunnel edge /24s, the fixed 1.1.1.1/1.0.0.1 hosts,
-  # and whatever api.cloudflare.com / cfd-features.argotunnel.com
-  # currently resolve to (as /32s). Resolution failures are warned
-  # about but do not abort the rest of the routing setup.
-  local edge_prefixes=("${CLOUDFLARE_TUNNEL_EDGE_PREFIXES[@]}")
-  local host_ip
-  for host_ip in "${CLOUDFLARE_TUNNEL_EDGE_HOSTS[@]}"; do
-    edge_prefixes+=("${host_ip}/32")
-  done
-
-  local hostname resolved_ips ip
-  for hostname in "${CLOUDFLARE_TUNNEL_EDGE_HOSTNAMES[@]}"; do
-    resolved_ips="$(resolve_ipv4_addresses "$hostname")"
-    if [[ -z "$resolved_ips" ]]; then
-      warn "Could not resolve ${hostname} to an IPv4 address; skipping its route for now."
-      continue
-    fi
-    while IFS= read -r ip; do
-      [[ -n "$ip" ]] && edge_prefixes+=("${ip}/32")
-    done <<<"$resolved_ips"
-  done
-
-  # Also route this host's currently configured DNS resolver(s) via the
-  # edge gateway. Once ipv4.never-default is set below, the edge
-  # interface loses its implicit default-route path to anything not
-  # explicitly listed here -- including the resolver cloudflared and its
-  # container need to resolve region1/region2.v2.argotunnel.com (SRV
-  # lookup) and the Cloudflare Tunnel edge hostnames above. On AWS this
-  # is normally the VPC's own Route 53 Resolver (VPC CIDR base + 2, e.g.
-  # 172.31.0.2 for a 172.31.0.0/16 VPC); reading /etc/resolv.conf
-  # instead of hardcoding that convention keeps this working on non-AWS
-  # hosts and any other resolver setup too. See:
-  # https://docs.aws.amazon.com/vpc/latest/userguide/AmazonDNS-concepts.html
-  local resolver_ip
-  while IFS= read -r resolver_ip; do
-    [[ -n "$resolver_ip" ]] && edge_prefixes+=("${resolver_ip}/32")
-  done < <(awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
-
-  # De-duplicate edge_prefixes: a resolv.conf nameserver may coincide
-  # with an already-listed fixed host (e.g. 1.1.1.1), and re-running
-  # this function can otherwise queue the same prefix twice in one
-  # pass, which would attempt a redundant (harmless but noisy) nmcli
-  # +ipv4.routes call below.
-  local -A seen_prefixes=()
-  local deduped_prefixes=()
-  for prefix in "${edge_prefixes[@]}"; do
-    [[ -n "${seen_prefixes[$prefix]:-}" ]] && continue
-    seen_prefixes["$prefix"]=1
-    deduped_prefixes+=("$prefix")
-  done
-  edge_prefixes=("${deduped_prefixes[@]}")
-
-  echo
-  info "Planned network changes so this host reaches Cloudflare Tunnel edge servers via ${edge_iface}, while everything else (including the public internet and RFC 1918 destinations) keeps using ${primary_iface} unchanged:"
-  info "  - Add static routes via ${edge_gateway} on '${edge_conn}' (${edge_iface}) for: ${edge_prefixes[*]}"
-  info "  - Set ipv4.never-default=yes on '${edge_conn}' (${edge_iface}) so NetworkManager never assigns it the default route"
-  read -r -p "Apply these network changes now? [y/N]: " confirm_routing
-  if [[ "${confirm_routing,,}" != "y" ]]; then
-    warn "Skipping Cloudflare Tunnel edge routing changes at your request."
-    return 0
-  fi
-
-  local existing_routes prefix route_changed=0
-  existing_routes="$(nmcli -t -g ipv4.routes connection show "$edge_conn" 2>/dev/null)"
-  for prefix in "${edge_prefixes[@]}"; do
-    if [[ "$existing_routes" == *"${prefix}"* ]]; then
-      info "Route for ${prefix} already present on '${edge_conn}', leaving as-is."
-      continue
-    fi
-    info "Adding route ${prefix} via ${edge_gateway} to '${edge_conn}'"
-    nmcli connection modify "$edge_conn" +ipv4.routes "${prefix} ${edge_gateway}" \
-      || { warn "Failed to add route ${prefix} to '${edge_conn}'"; continue; }
-    route_changed=1
-  done
-
-  local current_never_default
-  current_never_default="$(nmcli -t -g ipv4.never-default connection show "$edge_conn" 2>/dev/null)"
-  if [[ "${current_never_default,,}" != "yes" ]]; then
-    info "Setting ipv4.never-default=yes on '${edge_conn}' (${edge_iface})"
-    nmcli connection modify "$edge_conn" ipv4.never-default yes \
-      || { warn "Failed to set ipv4.never-default on '${edge_conn}'"; }
-    route_changed=1
-  else
-    info "ipv4.never-default already set on '${edge_conn}', leaving as-is."
-  fi
-
-  if [[ "$route_changed" == "1" ]]; then
-    nmcli device reapply "$edge_iface" \
-      || warn "Failed to reapply '${edge_conn}' on ${edge_iface}; changes are saved but may need 'nmcli connection up ${edge_conn}' (or a reboot) to take effect."
-  fi
-
-  echo
-  info "Resulting IPv4 routing table:"
-  ip -4 route show >&2
-}
-
-# Recover the edge interface name for the current instance from its
-# Quadlet .container file (written by create_quadlet_rootless() as
-# "Network=pasta:-i,<iface>"), without re-prompting the operator.
-edge_iface_from_container_file() {
+# Recover the container's interface name from its Quadlet .container
+# file (written by create_quadlet_rootless() as
+# "Network=pasta:-i,<iface>,--outbound-if4,<iface>,--outbound-if6,<iface>"),
+# without re-prompting the operator. Matches only the -i,<iface> token
+# (stops at the next comma) so the --outbound-if4/6 repeats of the same
+# interface don't get swept into the match. Used by action_upgrade to
+# re-apply the same pasta network line after rewriting the image drop-in.
+container_iface_from_container_file() {
   [[ -f "$CONTAINER_FILE" ]] || { warn "Container unit not found: ${CONTAINER_FILE}"; return 1; }
   local iface
   # grep -Eo exits non-zero when the pattern isn't found. Under
@@ -672,9 +273,9 @@ edge_iface_from_container_file() {
   # without a guard at the call site, the whole script) before the
   # empty-check below ever runs -- add `|| true` so a genuine "not
   # found" is reported by that check instead of a silent script exit.
-  iface="$(grep -Eo 'pasta:-i,[^[:space:]]+' "$CONTAINER_FILE" 2>/dev/null | sed -E 's/^pasta:-i,//' | head -n1 || true)"
+  iface="$(grep -Eo 'pasta:-i,[^,[:space:]]+' "$CONTAINER_FILE" 2>/dev/null | sed -E 's/^pasta:-i,//' | head -n1 || true)"
   if [[ -z "$iface" ]]; then
-    warn "Could not determine the edge interface from ${CONTAINER_FILE} (no 'pasta:-i,<iface>' network line found)."
+    warn "Could not determine the container's interface from ${CONTAINER_FILE} (no 'pasta:-i,<iface>' network line found)."
     return 1
   fi
   echo "$iface"
@@ -849,41 +450,40 @@ action_start() {
   user_systemctl "$CF_USER" status "${UNIT_BASE}.service" -l --no-pager || true
 }
 
-# Ensure the Quadlet .container unit has a "Network=pasta:-i,<iface>" line
-# telling pasta which host interface to copy addresses/routes from.
-# Older installs (created before this fix) have no Network= line at all,
-# which leaves pasta defaulting to the host's main/default-route
-# interface -- if TUNNEL_EDGE_BIND_ADDRESS is set to a *different*
-# interface's address, cloudflared fails with:
-#   bind: cannot assign requested address
-# Called from action_upgrade so existing deployments get the fix without
-# a full reinstall. Safe to call even when no bind address is set.
+# Ensure the Quadlet .container unit has a complete pasta Network= line:
+#   Network=pasta:-i,<iface>,--outbound-if4,<iface>,--outbound-if6,<iface>
+# -i alone only controls what the container's own namespace sees; it
+# does not pin pasta's host-side forwarding sockets to that interface
+# -- without --outbound-if4/6, those sockets fall back to whatever the
+# host's main routing table prefers (i.e. its default route), which
+# can silently egress a different interface than the one the operator
+# chose. Older installs (created before this fix, or before pasta
+# networking existed at all) may have no Network= line, or an
+# -i-only line missing the --outbound-if4/6 pinning -- both are
+# corrected here. Called from action_upgrade so existing deployments
+# get the fix without a full reinstall; also re-applies the existing
+# line unchanged when it's already correct, so repeated upgrades are
+# idempotent.
 repair_pasta_network_line() {
-  local bind_address="$1"
   [[ -f "$CONTAINER_FILE" ]] || { warn "Container unit not found, skipping network fix: ${CONTAINER_FILE}"; return 0; }
 
   local existing_network_line
   existing_network_line="$(grep -E '^Network=pasta:' "$CONTAINER_FILE" 2>/dev/null || true)"
 
   local iface=""
-  if [[ -n "$bind_address" ]]; then
-    iface="$(iface_for_ipv4_address "$bind_address")"
-  fi
+  iface="$(container_iface_from_container_file 2>/dev/null || true)"
 
   if [[ -z "$iface" ]]; then
     if [[ -n "$existing_network_line" ]]; then
       info "Existing Network= line found (${existing_network_line}); leaving it as-is."
       return 0
     fi
-    if [[ -n "$bind_address" ]]; then
-      warn "Could not determine which interface currently owns ${bind_address}."
-    fi
-    read -r -p "Enter the network interface cloudflared should bind Edge connections to [skip]: " iface
+    read -r -p "Enter the network interface the container should bind to [skip]: " iface
     [[ -n "$iface" ]] || { warn "No interface given; not adding a Network= line."; return 0; }
     iface_exists "$iface" || die "Interface not found: ${iface}"
   fi
 
-  local desired_network_line="Network=pasta:-i,${iface}"
+  local desired_network_line="Network=pasta:-i,${iface},--outbound-if4,${iface},--outbound-if6,${iface}"
   if [[ "$existing_network_line" == "$desired_network_line" ]]; then
     info "Network= line already correct (${desired_network_line})."
     return 0
@@ -952,27 +552,16 @@ action_upgrade() {
   info "Pulling new image as user ${CF_USER}: ${new_image}"
   user_run "$CF_USER" "podman pull '${new_image}'" || die "Failed to pull image: ${new_image}"
 
-  # Preserve the existing TUNNEL_EDGE_IP_VERSION / TUNNEL_EDGE_BIND_ADDRESS
-  # settings rather than dropping them on upgrade.
-  local current_edge_ip_version current_edge_bind_address
-  current_edge_ip_version="$(grep -E '^Environment=TUNNEL_EDGE_IP_VERSION=' "$IMAGE_DROPIN" 2>/dev/null | sed -E 's#^Environment=TUNNEL_EDGE_IP_VERSION=##' || true)"
-  current_edge_bind_address="$(grep -E '^Environment=TUNNEL_EDGE_BIND_ADDRESS=' "$IMAGE_DROPIN" 2>/dev/null | sed -E 's#^Environment=TUNNEL_EDGE_BIND_ADDRESS=##' || true)"
-  current_edge_ip_version="${current_edge_ip_version:-4}"
-
   info "Updating image drop-in: ${IMAGE_DROPIN}"
   {
     echo "[Container]"
     echo "Image=${new_image}"
     echo "Pull=never"
-    echo "Environment=TUNNEL_EDGE_IP_VERSION=${current_edge_ip_version}"
-    if [[ -n "$current_edge_bind_address" ]]; then
-      echo "Environment=TUNNEL_EDGE_BIND_ADDRESS=${current_edge_bind_address}"
-    fi
   } >"${IMAGE_DROPIN}"
   chown "${CF_USER}:${CF_USER}" "${IMAGE_DROPIN}"
   chmod 0600 "${IMAGE_DROPIN}"
 
-  repair_pasta_network_line "${current_edge_bind_address}"
+  repair_pasta_network_line
   repair_exec_protocol_flag
 
   info "Reloading systemd --user daemon for user: ${CF_USER}"
@@ -1035,14 +624,6 @@ action_daemon_reload() {
   info "Daemon reload complete."
 }
 
-action_refresh_edge_routing() {
-  local edge_iface
-  edge_iface="$(edge_iface_from_container_file)" || return 0
-  echo
-  info "Refreshing Cloudflare Tunnel edge static routes on interface: ${edge_iface}"
-  configure_edge_routing "$edge_iface"
-}
-
 print_menu() {
   echo
   echo "=========================================="
@@ -1056,7 +637,6 @@ print_menu() {
   echo "  6) Change tunnel token"
   echo "  7) Reload systemd --user daemon"
   echo "  8) Switch base username / prod-dev instance"
-  echo "  9) Refresh Cloudflare Tunnel edge static routes"
   echo "  q) Quit"
   echo
 }
@@ -1077,8 +657,7 @@ main() {
       upgrade)       action_upgrade ;;
       change-token)  action_change_token ;;
       daemon-reload) action_daemon_reload ;;
-      refresh-edge-routing) action_refresh_edge_routing ;;
-      *) die "Unknown action: ${1}. Valid actions: status, restart, stop, start, upgrade, change-token, daemon-reload, refresh-edge-routing" ;;
+      *) die "Unknown action: ${1}. Valid actions: status, restart, stop, start, upgrade, change-token, daemon-reload" ;;
     esac
     exit 0
   fi
@@ -1095,7 +674,6 @@ main() {
       6) action_change_token ;;
       7) action_daemon_reload ;;
       8) resolve_instance ;;
-      9) action_refresh_edge_routing ;;
       q|Q) info "Exiting."; exit 0 ;;
       *) warn "Invalid selection: ${choice}" ;;
     esac
@@ -1118,19 +696,31 @@ MANAGE_SCRIPT_EOF
 #     - prod uses unit basename "cloudflared" (unit: cloudflared.service)
 #     - dev uses unit basename "cloudflared-dev" (unit: cloudflared-dev.service)
 #       and all drop-in filenames are suffixed "-dev"
-#   edge_bind_address: IPv4 address written to TUNNEL_EDGE_BIND_ADDRESS in
-#     the image drop-in, alongside a hardcoded TUNNEL_EDGE_IP_VERSION=4.
-#     Same value used for both prod and dev (derived once from the
-#     interface the user selects in main()).
-#   edge_iface: the same interface edge_bind_address was derived from.
-#     Passed to pasta as "-i <iface>" (Network=pasta:-i,<iface> in the
-#     unit) so pasta copies that interface's address/routes into the
-#     container namespace -- otherwise pasta only copies the host's
-#     main/default-route interface, and binding to a non-default
-#     interface's address from inside the container fails with
-#     "bind: cannot assign requested address".
+#   container_iface: the host interface the container is isolated to.
+#     Passed to pasta via two independent flags, both required:
+#       -i <iface>              -- which host interface pasta reads
+#                                   addresses/routes/gateway FROM to
+#                                   populate the container's own
+#                                   network namespace (what the
+#                                   container itself sees via its
+#                                   "ip route").
+#       --outbound-if4 <iface>  -- which host interface pasta's own
+#       --outbound-if6 <iface>     forwarding sockets actually bind to
+#                                   and egress on, on the HOST side.
+#     -i alone does not pin pasta's host-side sockets to that
+#     interface -- left unset, those sockets fall back to whatever the
+#     host's main routing table prefers (i.e. its default route, which
+#     may be a different interface entirely). Setting --outbound-if4/6
+#     to the same interface as -i closes that gap, so the container is
+#     genuinely isolated end-to-end: its own namespace only knows
+#     about this interface, AND pasta's real host-side traffic for it
+#     can only egress this interface, never the host's default route.
+#     Same value used for both prod and dev (selected once in main()).
+#     Without an explicit Network= line, pasta defaults to the host's
+#     main/default-route interface, which is why this is always set
+#     explicitly rather than left implicit.
 create_quadlet_rootless() {
-  local instance="$1" u="$2" tag="$3" token="$4" edge_bind_address="$5" edge_iface="$6"
+  local instance="$1" u="$2" tag="$3" token="$4" container_iface="$5"
   local homedir quadlet_dir unit_base container_name container_file dropin_dir
   local image_dropin icmp_dropin token_dropin env_file suffix
 
@@ -1169,7 +759,7 @@ After=network-online.target
 [Container]
 ContainerName=${container_name}
 Exec=tunnel --no-autoupdate --protocol quic run
-Network=pasta:-i,${edge_iface}
+Network=pasta:-i,${container_iface},--outbound-if4,${container_iface},--outbound-if6,${container_iface}
 
 [Service]
 Restart=always
@@ -1185,8 +775,6 @@ EOF
 [Container]
 Image=docker.io/cloudflare/cloudflared:${tag}
 Pull=never
-Environment=TUNNEL_EDGE_IP_VERSION=4
-Environment=TUNNEL_EDGE_BIND_ADDRESS=${edge_bind_address}
 EOF
   chown "$u:$u" "$image_dropin"
   chmod 0600 "$image_dropin"
@@ -1258,25 +846,39 @@ main() {
   CF_USER="${BASE_USER}-prod"
 
   #-----------------------------------------------------------------------
-  # Cloudflare Edge bind address -- same value used for both prod and dev.
-  # TUNNEL_EDGE_IP_VERSION is always "4"; no prompt needed for it.
+  # Container interface -- same value used for both prod and dev. This
+  # interface is handed entirely to the container via pasta ("-i
+  # <iface>"); the host's own routing table for it is never touched.
+  # Only prompted when the host has more than one physical Ethernet
+  # adapter -- with exactly one, it's auto-selected and reported.
   #-----------------------------------------------------------------------
   echo
-  local edge_iface=""
-  while true; do
-    read -r -p "Enter the network interface to bind outgoing Cloudflare Edge connections to [eth0]: " edge_iface
-    edge_iface="${edge_iface:-eth0}"
-    if iface_exists "${edge_iface}"; then
-      break
+  local container_iface=""
+  local -a eth_ifaces=()
+  while IFS= read -r iface_line; do
+    [[ -n "$iface_line" ]] && eth_ifaces+=("$iface_line")
+  done < <(list_ethernet_ifaces)
+
+  if [[ "${#eth_ifaces[@]}" -eq 1 ]]; then
+    container_iface="${eth_ifaces[0]}"
+    info "Only one physical Ethernet adapter found (${container_iface}); using it for the container with no prompt."
+  else
+    if [[ "${#eth_ifaces[@]}" -eq 0 ]]; then
+      warn "Could not detect any physical Ethernet adapters; falling back to a manual prompt."
+    else
+      info "Detected Ethernet adapters: ${eth_ifaces[*]}"
     fi
-    warn "Interface not found: ${edge_iface}"
-  done
+    while true; do
+      read -r -p "Enter the network interface the container should use [eth0]: " container_iface
+      container_iface="${container_iface:-eth0}"
+      if iface_exists "${container_iface}"; then
+        break
+      fi
+      warn "Interface not found: ${container_iface}"
+    done
+  fi
 
-  EDGE_BIND_ADDRESS="$(iface_ipv4_address "${edge_iface}")"
-  [[ -n "${EDGE_BIND_ADDRESS}" ]] || die "Could not determine an IPv4 address for interface: ${edge_iface}"
-  info "Using TUNNEL_EDGE_BIND_ADDRESS=${EDGE_BIND_ADDRESS} (from interface ${edge_iface}), TUNNEL_EDGE_IP_VERSION=4"
-
-  configure_edge_routing "${edge_iface}"
+  info "Container will be isolated to interface: ${container_iface} (pasta -i ${container_iface}; host routing table left unchanged)"
 
   #-----------------------------------------------------------------------
   # "prod" instance (always installed)
@@ -1298,7 +900,7 @@ main() {
 
   enable_linger_for_user "${CF_USER}"
   pull_cloudflared_image_rootless "${CF_USER}" "${CF_TAG}"
-  create_quadlet_rootless "prod" "${CF_USER}" "${CF_TAG}" "${CF_TOKEN}" "${EDGE_BIND_ADDRESS}" "${edge_iface}"
+  create_quadlet_rootless "prod" "${CF_USER}" "${CF_TAG}" "${CF_TOKEN}" "${container_iface}"
 
   #-----------------------------------------------------------------------
   # "dev" instance (optional) -- always runs as "${BASE_USER}-dev"
@@ -1322,7 +924,7 @@ main() {
 
     enable_linger_for_user "${DEV_USER}"
     pull_cloudflared_image_rootless "${DEV_USER}" "${DEV_TAG}"
-    create_quadlet_rootless "dev" "${DEV_USER}" "${DEV_TAG}" "${DEV_TOKEN}" "${EDGE_BIND_ADDRESS}" "${edge_iface}"
+    create_quadlet_rootless "dev" "${DEV_USER}" "${DEV_TAG}" "${DEV_TOKEN}" "${container_iface}"
   else
     info "Skipping dev container installation."
   fi
