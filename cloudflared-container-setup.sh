@@ -50,18 +50,25 @@
 #    users, "<base>-prod" and "<base>-dev", derived from one base username.
 #  - The container interface (container_iface) is selected once and
 #    shared by both instances; it is passed to pasta via
-#    "Network=pasta:-i,<iface>,--outbound-if4,<iface>,--outbound-if6,<iface>"
-#    in each instance's Quadlet .container file only. -i controls what
-#    the container's own namespace sees (addresses/routes/gateway
-#    copied in via pasta's "--config-net"); --outbound-if4/6 separately
-#    pin pasta's own host-side forwarding sockets to the same
+#    "Network=pasta:-i,<iface>,--outbound-if4,<iface>" in each
+#    instance's Quadlet .container file only. -i controls what the
+#    container's own namespace sees (addresses/routes/gateway copied
+#    in via pasta's "--config-net"); --outbound-if4 separately pins
+#    pasta's own IPv4 host-side forwarding sockets to the same
 #    interface, since -i alone does not do that -- left unset, those
 #    sockets would fall back to whatever the host's main routing table
 #    prefers (its default route), which can be a different interface
-#    entirely. With both set, the container is isolated end-to-end:
-#    its namespace only knows this interface, and pasta's real
-#    host-side traffic for it can only egress this interface. The
-#    host's own routing table for that interface is never modified.
+#    entirely. With both set, the container is isolated end-to-end for
+#    IPv4: its namespace only knows this interface, and pasta's real
+#    host-side traffic for it can only egress this interface. IPv6 is
+#    deliberately NOT pinned with --outbound-if6: pasta requires the
+#    named interface to have a genuinely usable (global, non-link-
+#    local) IPv6 address, and will abort the whole container start
+#    with "External interface not usable" if it doesn't -- an
+#    interface with only an automatic fe80::/10 link-local address
+#    (the common case for an otherwise IPv4-only interface) fails this
+#    check outright. The host's own routing table for the interface is
+#    never modified.
 #
 # Usage:
 #   sudo bash cloudflared-container-setup.sh
@@ -260,10 +267,10 @@ iface_exists() { ip link show dev "$1" >/dev/null 2>&1; }
 
 # Recover the container's interface name from its Quadlet .container
 # file (written by create_quadlet_rootless() as
-# "Network=pasta:-i,<iface>,--outbound-if4,<iface>,--outbound-if6,<iface>"),
-# without re-prompting the operator. Matches only the -i,<iface> token
-# (stops at the next comma) so the --outbound-if4/6 repeats of the same
-# interface don't get swept into the match. Used by action_upgrade to
+# "Network=pasta:-i,<iface>,--outbound-if4,<iface>"), without
+# re-prompting the operator. Matches only the -i,<iface> token (stops
+# at the next comma) so the --outbound-if4 repeat of the same
+# interface doesn't get swept into the match. Used by action_upgrade to
 # re-apply the same pasta network line after rewriting the image drop-in.
 container_iface_from_container_file() {
   [[ -f "$CONTAINER_FILE" ]] || { warn "Container unit not found: ${CONTAINER_FILE}"; return 1; }
@@ -451,15 +458,20 @@ action_start() {
 }
 
 # Ensure the Quadlet .container unit has a complete pasta Network= line:
-#   Network=pasta:-i,<iface>,--outbound-if4,<iface>,--outbound-if6,<iface>
+#   Network=pasta:-i,<iface>,--outbound-if4,<iface>
 # -i alone only controls what the container's own namespace sees; it
 # does not pin pasta's host-side forwarding sockets to that interface
-# -- without --outbound-if4/6, those sockets fall back to whatever the
+# -- without --outbound-if4, those sockets fall back to whatever the
 # host's main routing table prefers (i.e. its default route), which
 # can silently egress a different interface than the one the operator
-# chose. Older installs (created before this fix, or before pasta
+# chose. --outbound-if6 is deliberately NOT added: pasta requires the
+# named interface to have a genuinely usable (global, non-link-local)
+# IPv6 address, and aborts the whole container start with "External
+# interface not usable" if it only has the automatic fe80::/10
+# link-local address -- the common case for an otherwise IPv4-only
+# interface. Older installs (created before this fix, or before pasta
 # networking existed at all) may have no Network= line, or an
-# -i-only line missing the --outbound-if4/6 pinning -- both are
+# -i-only line missing the --outbound-if4 pinning -- both are
 # corrected here. Called from action_upgrade so existing deployments
 # get the fix without a full reinstall; also re-applies the existing
 # line unchanged when it's already correct, so repeated upgrades are
@@ -483,7 +495,7 @@ repair_pasta_network_line() {
     iface_exists "$iface" || die "Interface not found: ${iface}"
   fi
 
-  local desired_network_line="Network=pasta:-i,${iface},--outbound-if4,${iface},--outbound-if6,${iface}"
+  local desired_network_line="Network=pasta:-i,${iface},--outbound-if4,${iface}"
   if [[ "$existing_network_line" == "$desired_network_line" ]]; then
     info "Network= line already correct (${desired_network_line})."
     return 0
@@ -705,19 +717,27 @@ MANAGE_SCRIPT_EOF
 #                                   container itself sees via its
 #                                   "ip route").
 #       --outbound-if4 <iface>  -- which host interface pasta's own
-#       --outbound-if6 <iface>     forwarding sockets actually bind to
-#                                   and egress on, on the HOST side.
+#                                   IPv4 forwarding sockets actually
+#                                   bind to and egress on, on the HOST
+#                                   side.
 #     -i alone does not pin pasta's host-side sockets to that
 #     interface -- left unset, those sockets fall back to whatever the
 #     host's main routing table prefers (i.e. its default route, which
-#     may be a different interface entirely). Setting --outbound-if4/6
+#     may be a different interface entirely). Setting --outbound-if4
 #     to the same interface as -i closes that gap, so the container is
-#     genuinely isolated end-to-end: its own namespace only knows
-#     about this interface, AND pasta's real host-side traffic for it
-#     can only egress this interface, never the host's default route.
-#     Same value used for both prod and dev (selected once in main()).
-#     Without an explicit Network= line, pasta defaults to the host's
-#     main/default-route interface, which is why this is always set
+#     genuinely isolated end-to-end for IPv4: its own namespace only
+#     knows about this interface, AND pasta's real host-side traffic
+#     for it can only egress this interface, never the host's default
+#     route. --outbound-if6 is deliberately NOT set: pasta requires
+#     the named interface to have a genuinely usable (global,
+#     non-link-local) IPv6 address, and aborts the ENTIRE container
+#     start with "External interface not usable" if it only has the
+#     automatic fe80::/10 link-local address every interface gets --
+#     the common case for an otherwise IPv4-only interface (confirmed
+#     on this deployment's eth1). Same value used for both prod and
+#     dev (selected once in main()). Without an explicit Network=
+#     line, pasta defaults to the host's main/default-route interface,
+#     which is why this is always set
 #     explicitly rather than left implicit.
 create_quadlet_rootless() {
   local instance="$1" u="$2" tag="$3" token="$4" container_iface="$5"
@@ -759,7 +779,7 @@ After=network-online.target
 [Container]
 ContainerName=${container_name}
 Exec=tunnel --no-autoupdate --protocol quic run
-Network=pasta:-i,${container_iface},--outbound-if4,${container_iface},--outbound-if6,${container_iface}
+Network=pasta:-i,${container_iface},--outbound-if4,${container_iface}
 
 [Service]
 Restart=always
