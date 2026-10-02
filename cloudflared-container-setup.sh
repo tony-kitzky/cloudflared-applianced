@@ -164,6 +164,69 @@ user_systemctl() {
   sudo -u "$u" env XDG_RUNTIME_DIR="/run/user/${uid}" systemctl --user "$@"
 }
 
+# Check which transport protocol cloudflared's currently-registered
+# tunnel connections actually negotiated, by reading "Registered
+# tunnel connection ... protocol=<quic|http2>" lines from this boot's
+# journal for unit $2 (as user $1). This reflects the real, live
+# connections -- NOT cloudflared's own startup "connectivity
+# pre-checks" summary (the "SUMMARY: Environment ready with degraded
+# transport..." message), which Cloudflare's own docs describe as
+# purely diagnostic and non-blocking: it can warn about a transport
+# probe failure (e.g. to region2) even when every connection the
+# tunnel actually registers ends up using QUIC. Only the per-connection
+# "protocol=" field reflects what's really in use. Prints one line per
+# distinct connection (deduplicated by connection ID, keeping the most
+# recent registration if a connection re-registered) and warns loudly
+# if any is not "quic". Returns 1 if any non-quic connection is found
+# or none could be read at all, 0 if every connection found is quic.
+check_tunnel_protocol() {
+  local u="$1" unit="$2"
+  local uid; uid="$(user_uid "$u")"
+  local lines
+  lines="$(sudo -u "$u" env XDG_RUNTIME_DIR="/run/user/${uid}" \
+    journalctl --user -u "$unit" -b --no-pager 2>/dev/null | \
+    grep -E 'Registered tunnel connection' || true)"
+
+  if [[ -z "$lines" ]]; then
+    warn "No 'Registered tunnel connection' log lines found for ${unit} yet -- cannot verify protocol (service may still be starting; try again in a few seconds)."
+    return 1
+  fi
+
+  # Keep only the last registration line per connection= ID, in case a
+  # connection dropped and re-registered during this boot.
+  local parsed
+  parsed="$(echo "$lines" | grep -oE 'connection=[^ ]+ event=[0-9]+ ip=[^ ]+ location=[^ ]+ protocol=[a-z0-9]+' | \
+    awk -F'connection=| location=| protocol=' '{conn=$2; sub(/ .*/,"",conn); print conn"\t"$0}' | \
+    sort -k1,1 -u)"
+
+  if [[ -z "$parsed" ]]; then
+    warn "Found 'Registered tunnel connection' lines for ${unit} but could not parse connection/protocol fields -- check journal format: journalctl --user -u ${unit} -b | grep 'Registered tunnel connection'"
+    return 1
+  fi
+
+  local any_bad=0
+  local rest location protocol
+  while IFS=$'\t' read -r _conn_field rest; do
+    [[ -n "$rest" ]] || continue
+    location="$(echo "$rest" | grep -oE 'location=[^ ]+' | sed 's/^location=//')"
+    protocol="$(echo "$rest" | grep -oE 'protocol=[a-z0-9]+' | sed 's/^protocol=//')"
+    if [[ "$protocol" == "quic" ]]; then
+      info "Tunnel connection OK: location=${location:-?} protocol=quic"
+    else
+      any_bad=1
+      warn "Tunnel connection DEGRADED: location=${location:-?} protocol=${protocol:-unknown} (expected quic)"
+    fi
+  done <<<"$parsed"
+
+  if [[ "$any_bad" -eq 1 ]]; then
+    warn "${unit}: at least one tunnel connection is NOT using QUIC. Check firewall/UDP egress on port 7844 for the container's interface."
+    return 1
+  fi
+
+  info "${unit}: all registered tunnel connections are using QUIC."
+  return 0
+}
+
 install_packages() {
   info "Installing packages: podman, passt"
   dnf install -y podman passt >/dev/null
@@ -322,6 +385,69 @@ user_run() {
   sudo -H -u "$u" env XDG_RUNTIME_DIR="$runtime_dir" bash -lc "cd '$homedir' && $*"
 }
 
+# Check which transport protocol cloudflared's currently-registered
+# tunnel connections actually negotiated, by reading "Registered
+# tunnel connection ... protocol=<quic|http2>" lines from this boot's
+# journal for unit $2 (as user $1). This reflects the real, live
+# connections -- NOT cloudflared's own startup "connectivity
+# pre-checks" summary (the "SUMMARY: Environment ready with degraded
+# transport..." message), which Cloudflare's own docs describe as
+# purely diagnostic and non-blocking: it can warn about a transport
+# probe failure (e.g. to region2) even when every connection the
+# tunnel actually registers ends up using QUIC. Only the per-connection
+# "protocol=" field reflects what's really in use. Prints one line per
+# distinct connection (deduplicated by connection ID, keeping the most
+# recent registration if a connection re-registered) and warns loudly
+# if any is not "quic". Returns 1 if any non-quic connection is found
+# or none could be read at all, 0 if every connection found is quic.
+check_tunnel_protocol() {
+  local u="$1" unit="$2"
+  local uid; uid="$(user_uid "$u")"
+  local lines
+  lines="$(sudo -u "$u" env XDG_RUNTIME_DIR="/run/user/${uid}" \
+    journalctl --user -u "$unit" -b --no-pager 2>/dev/null | \
+    grep -E 'Registered tunnel connection' || true)"
+
+  if [[ -z "$lines" ]]; then
+    warn "No 'Registered tunnel connection' log lines found for ${unit} yet -- cannot verify protocol (service may still be starting; try again in a few seconds)."
+    return 1
+  fi
+
+  # Keep only the last registration line per connection= ID, in case a
+  # connection dropped and re-registered during this boot.
+  local parsed
+  parsed="$(echo "$lines" | grep -oE 'connection=[^ ]+ event=[0-9]+ ip=[^ ]+ location=[^ ]+ protocol=[a-z0-9]+' | \
+    awk -F'connection=| location=| protocol=' '{conn=$2; sub(/ .*/,"",conn); print conn"\t"$0}' | \
+    sort -k1,1 -u)"
+
+  if [[ -z "$parsed" ]]; then
+    warn "Found 'Registered tunnel connection' lines for ${unit} but could not parse connection/protocol fields -- check journal format: journalctl --user -u ${unit} -b | grep 'Registered tunnel connection'"
+    return 1
+  fi
+
+  local any_bad=0
+  local rest location protocol
+  while IFS=$'\t' read -r _conn_field rest; do
+    [[ -n "$rest" ]] || continue
+    location="$(echo "$rest" | grep -oE 'location=[^ ]+' | sed 's/^location=//')"
+    protocol="$(echo "$rest" | grep -oE 'protocol=[a-z0-9]+' | sed 's/^protocol=//')"
+    if [[ "$protocol" == "quic" ]]; then
+      info "Tunnel connection OK: location=${location:-?} protocol=quic"
+    else
+      any_bad=1
+      warn "Tunnel connection DEGRADED: location=${location:-?} protocol=${protocol:-unknown} (expected quic)"
+    fi
+  done <<<"$parsed"
+
+  if [[ "$any_bad" -eq 1 ]]; then
+    warn "${unit}: at least one tunnel connection is NOT using QUIC. Check firewall/UDP egress on port 7844 for the container's interface."
+    return 1
+  fi
+
+  info "${unit}: all registered tunnel connections are using QUIC."
+  return 0
+}
+
 # Try to auto-detect a sensible default base username by scanning for any
 # existing "<base>-prod" or "<base>-dev" account with a Quadlet container
 # file already in place. Falls back to "cloudflared" if nothing is found.
@@ -416,6 +542,11 @@ action_status() {
   else
     warn "${UNIT_BASE}.service unit not found; skipping journal output"
   fi
+
+  echo
+  info "== Tunnel connection protocol (live connections, not the startup pre-check) =="
+  check_tunnel_protocol "$CF_USER" "${UNIT_BASE}.service" || \
+    warn "Protocol check reported an issue -- see above."
 }
 
 #------------------------------------------------------------------------------
@@ -922,6 +1053,11 @@ main() {
   pull_cloudflared_image_rootless "${CF_USER}" "${CF_TAG}"
   create_quadlet_rootless "prod" "${CF_USER}" "${CF_TAG}" "${CF_TOKEN}" "${container_iface}"
 
+  info "Waiting for prod tunnel connections to register before checking protocol..."
+  sleep 10
+  check_tunnel_protocol "${CF_USER}" "cloudflared.service" || \
+    warn "PROD: one or more tunnel connections established using http2 instead of quic. Run 'sudo cloudflared-container' (option 1, status) to re-check, and see WARN lines above for which region/connection degraded -- this usually means outbound UDP/7844 is blocked for ${container_iface}."
+
   #-----------------------------------------------------------------------
   # "dev" instance (optional) -- always runs as "${BASE_USER}-dev"
   #-----------------------------------------------------------------------
@@ -945,6 +1081,11 @@ main() {
     enable_linger_for_user "${DEV_USER}"
     pull_cloudflared_image_rootless "${DEV_USER}" "${DEV_TAG}"
     create_quadlet_rootless "dev" "${DEV_USER}" "${DEV_TAG}" "${DEV_TOKEN}" "${container_iface}"
+
+    info "Waiting for dev tunnel connections to register before checking protocol..."
+    sleep 10
+    check_tunnel_protocol "${DEV_USER}" "cloudflared-dev.service" || \
+      warn "DEV: one or more tunnel connections established using http2 instead of quic. Run 'sudo cloudflared-container' (option 1, status) to re-check, and see WARN lines above for which region/connection degraded -- this usually means outbound UDP/7844 is blocked for ${container_iface}."
   else
     info "Skipping dev container installation."
   fi
