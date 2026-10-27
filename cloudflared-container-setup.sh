@@ -267,6 +267,9 @@ net.ipv6.ping_group_range = 0 65532
 # QUIC UDP socket buffer ceilings (helps avoid quic-go UDP buffer warnings).
 net.core.rmem_max = 12000000
 net.core.wmem_max = 12000000
+
+# Allow asymetric "loose" return-path on eth1 (required in Azure).
+net.ipv4.conf.eth1.rp_filter = 2
 EOF
 
   sysctl --system >/dev/null
